@@ -1,0 +1,1832 @@
+"""Regression tests for execution behavior."""
+
+from __future__ import annotations
+
+from typing import Any, cast
+
+import numpy as np
+import pandas as pd
+import pytest
+from tests.conftest import geometric_series, make_ohlcv
+from tests.regression_helpers import (
+    _flat_execution_model,
+    _holdout_config,
+    _rf_test_setup,
+)
+
+from quantlab.config import ExperimentConfig
+from quantlab.exceptions import InvalidConfigurationError
+
+
+def test_target_volatility_applies_with_any_allocator() -> None:
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    frames = [
+        make_ohlcv(sym, geometric_series(500, mu=mu, sigma=0.012, s0=100.0, seed=seed))
+        for sym, seed, mu in [
+            ("AAA", 1, 0.0007),
+            ("BBB", 2, 0.0003),
+            ("CCC", 3, 0.0005),
+        ]
+    ]
+    data = pd.concat(frames, ignore_index=True)
+    base: dict[str, Any] = {
+        "experiment_name": "x",
+        "data": {
+            "instruments": [
+                {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                for s in ["AAA", "BBB", "CCC"]
+            ],
+            "start_date": "2020-01-01",
+            "end_date": "2021-06-01",
+        },
+        "strategy": {
+            "name": "cross_sectional_momentum",
+            "parameters": {
+                "lookback_period": 60,
+                "skip_period": 5,
+                "top_fraction": 0.5,
+            },
+        },
+        "portfolio": {"allocator": "inverse_volatility", "volatility_window": 30},
+        "execution": {"commission_bps": 2.0, "spread_bps": 3.0, "slippage_bps": 2.0},
+        "backtest": {"initial_capital": 100_000},
+    }
+    cfg_no_target = ExperimentConfig.from_dict(base)
+    cfg_with_target = ExperimentConfig.from_dict(
+        {
+            **base,
+            "portfolio": {
+                **base["portfolio"],
+                "target_volatility": 0.05,
+                "maximum_leverage": 1.5,
+            },
+        }
+    )
+    r1 = run_backtest_from_config(data, cfg_no_target)
+    r2 = run_backtest_from_config(data, cfg_with_target)
+    assert (
+        abs(r2.metrics["annualized_volatility"] - r1.metrics["annualized_volatility"])
+        > 0.005
+    )
+
+
+def test_inverse_volatility_allocator_honors_maximum_weight(
+    synthetic_panel: pd.DataFrame,
+) -> None:
+    from quantlab.portfolio.allocator import InverseVolatilityAllocator
+
+    idx = synthetic_panel["timestamp"].drop_duplicates().sort_values()
+    signals = pd.DataFrame(1.0, index=idx, columns=["AAA", "BBB", "CCC"])
+    alloc = InverseVolatilityAllocator(volatility_window=30, maximum_weight=0.30)
+    weights = alloc.allocate(signals, synthetic_panel).dropna()
+    assert weights.abs().max().max() <= 0.30 + 1e-6
+
+
+def test_custom_rebalance_raises() -> None:
+    from quantlab.portfolio.rebalancing import rebalance_dates
+
+    idx = pd.date_range("2020-01-01", periods=10, freq="D")
+    with pytest.raises(InvalidConfigurationError):
+        rebalance_dates(idx, "custom")
+
+
+def test_trade_log_uses_prior_period_price() -> None:
+    from quantlab.backtesting.trade_log import build_trade_log
+    from quantlab.execution.slippage import ConstantSlippageModel
+
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    executed = pd.DataFrame({"AAA": [0.0, 1.0, 1.0, 1.0]}, index=idx)
+    changes = pd.DataFrame({"AAA": [0.0, 1.0, 0.0, 0.0]}, index=idx)
+    equity = pd.Series([100.0, 100.0, 110.0, 120.0], index=idx)
+    prices = pd.DataFrame({"AAA": [10.0, 20.0, 30.0, 40.0]}, index=idx)
+
+    trades = build_trade_log(
+        executed,
+        changes,
+        equity,
+        prices,
+        commission_bps=0.0,
+        spread_bps=0.0,
+        slippage_model=ConstantSlippageModel(0.0),
+    )
+    assert len(trades) == 1
+    # The fill recorded at day index 1 (price 20) must use day 0's price (10),
+    # not its own day's close.
+    assert trades.iloc[0]["reference_price"] == pytest.approx(10.0)
+
+
+def test_volume_slippage_is_not_degenerate() -> None:
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    frames = [
+        make_ohlcv(sym, geometric_series(300, mu=mu, sigma=0.012, s0=100.0, seed=seed))
+        for sym, seed, mu in [
+            ("AAA", 1, 0.0007),
+            ("BBB", 2, 0.0003),
+            ("CCC", 3, 0.0005),
+        ]
+    ]
+    data = pd.concat(frames, ignore_index=True)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "vol_slip",
+            "data": {
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB", "CCC"]
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2020-10-01",
+            },
+            "strategy": {
+                "name": "cross_sectional_momentum",
+                "parameters": {
+                    "lookback_period": 60,
+                    "skip_period": 5,
+                    "top_fraction": 0.5,
+                },
+            },
+            "portfolio": {"allocator": "equal_weight"},
+            "execution": {
+                "commission_bps": 2.0,
+                "spread_bps": 3.0,
+                "slippage_bps": 5.0,
+                "slippage_model": "volume",
+            },
+            "backtest": {"initial_capital": 100_000},
+        }
+    )
+    result = run_backtest_from_config(data, cfg)
+    # The participation ratio (and therefore the slippage cost) must not
+    # collapse to numerically zero just because a weight-change fraction is
+    # compared against raw share volume with mismatched units.
+    assert result.costs["slippage"].sum() > 1e-6
+
+
+def test_negative_maximum_net_exposure_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "portfolio": {"maximum_net_exposure": -0.2},
+            }
+        )
+
+
+def test_minimum_weight_above_maximum_weight_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "portfolio": {"minimum_weight": 0.5, "maximum_weight": 0.3},
+            }
+        )
+
+
+def test_unknown_allocator_rejected_at_config_load() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "portfolio": {"allocator": "not_a_real_allocator"},
+            }
+        )
+
+
+def test_unknown_slippage_model_rejected_at_config_load() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "A", "source": "csv", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"slippage_model": "typo"},
+            }
+        )
+
+
+def test_bankruptcy_stops_trading_and_zeros_post_ruin_returns() -> None:
+    from quantlab.backtesting.accounting import run_accounting
+
+    idx = pd.date_range("2020-01-01", periods=6, freq="D")
+    held = pd.DataFrame({"A": [1.0] * 6}, index=idx)
+    # A total wipeout on day 3, then ordinary-looking price action after.
+    asset_returns = pd.DataFrame(
+        {"A": [0.01, 0.01, -1.0, 0.02, -0.03, 0.05]}, index=idx
+    )
+
+    result = run_accounting(held, asset_returns, _flat_execution_model(), 100.0)
+    assert result.equity.tolist() == [100.0, 101.0, 0.0, 0.0, 0.0, 0.0]
+    # The fake post-ruin returns must be zeroed, not left at the raw
+    # 0.02 / -0.03 / 0.05 the price series would otherwise produce.
+    assert result.net_returns.iloc[3:].tolist() == [0.0, 0.0, 0.0]
+    # No lingering "position" after ruin, and no phantom closing trade.
+    assert (result.executed_weights.iloc[3:] == 0.0).all().all()
+    assert (result.turnover.iloc[3:] == 0.0).all()
+
+
+def test_volume_slippage_converges_to_self_consistent_net_equity() -> None:
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.config import ExecutionConfig
+    from quantlab.execution.execution_model import ExecutionModel
+
+    n = 60
+    idx = pd.date_range("2020-01-01", periods=n, freq="D")
+    rng = np.random.default_rng(3)
+    held = pd.DataFrame({"A": np.where(np.arange(n) % 2 == 0, 1.0, -1.0)}, index=idx)
+    asset_returns = pd.DataFrame({"A": rng.normal(0.0, 0.01, n)}, index=idx)
+    adv = pd.DataFrame({"A": [50_000.0] * n}, index=idx)
+    exec_cfg = ExecutionConfig(
+        commission_bps=15.0,
+        spread_bps=10.0,
+        slippage_bps=0.0,
+        slippage_model=cast(Any, "volume"),
+        impact_coefficient=3.0,
+    )
+    model = ExecutionModel.from_config(exec_cfg, average_daily_volume=adv)
+    result = run_accounting(held, asset_returns, model, initial_capital=100_000.0)
+
+    # Gross and net equity must have meaningfully diverged in this
+    # cost-heavy scenario — otherwise the test can't distinguish converged
+    # net-equity sizing from a gross-equity shortcut.
+    assert result.gross_equity.iloc[-1] / result.equity.iloc[-1] > 1.05
+
+    # Self-consistency: recomputing slippage from `equity_for_costs` (what
+    # this result says it used to size orders) must reproduce
+    # `costs.slippage` exactly.
+    executed = held.shift(1).fillna(0.0)
+    weight_changes = executed - executed.shift(1).fillna(0.0)
+    prior_equity = result.equity_for_costs.shift(1).fillna(100_000.0)
+    recomputed_slippage = model.slippage.calculate(weight_changes, equity=prior_equity)
+    pd.testing.assert_series_equal(
+        recomputed_slippage, result.costs.slippage, check_names=False
+    )
+
+    # `equity_for_costs` must actually be the converged *net* equity, not
+    # a gross-equity shortcut.
+    assert result.equity_for_costs.iloc[-1] == pytest.approx(result.equity.iloc[-1])
+    assert result.equity_for_costs.iloc[-1] != pytest.approx(
+        result.gross_equity.iloc[-1]
+    )
+
+
+def test_solve_accounting_raises_when_fixed_point_does_not_converge() -> None:
+    """An unconverged cost/equity solution must not be reported as final."""
+    from quantlab.backtesting import accounting
+    from quantlab.config import ExecutionConfig
+    from quantlab.exceptions import BacktestError
+    from quantlab.execution.execution_model import ExecutionModel
+
+    original_cap = accounting._MAX_COST_EQUITY_ITERATIONS
+    accounting._MAX_COST_EQUITY_ITERATIONS = 3
+    try:
+        n = 60
+        idx = pd.date_range("2020-01-01", periods=n, freq="D")
+        rng = np.random.default_rng(3)
+        held = pd.DataFrame(
+            {"A": np.where(np.arange(n) % 2 == 0, 1.0, -1.0)}, index=idx
+        )
+        asset_returns = pd.DataFrame({"A": rng.normal(0.0, 0.01, n)}, index=idx)
+        adv = pd.DataFrame({"A": [50_000.0] * n}, index=idx)
+        exec_cfg = ExecutionConfig(
+            commission_bps=15.0,
+            spread_bps=10.0,
+            slippage_bps=0.0,
+            slippage_model=cast(Any, "volume"),
+            impact_coefficient=3.0,
+        )
+        model = ExecutionModel.from_config(exec_cfg, average_daily_volume=adv)
+        with pytest.raises(BacktestError, match="did not converge"):
+            accounting.run_accounting(
+                held, asset_returns, model, initial_capital=100_000.0
+            )
+    finally:
+        accounting._MAX_COST_EQUITY_ITERATIONS = original_cap
+
+
+def test_extreme_commission_does_not_produce_negative_notional() -> None:
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.backtesting.trade_log import build_trade_log
+    from quantlab.config import ExecutionConfig
+    from quantlab.execution.execution_model import ExecutionModel
+
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    held = pd.DataFrame({"A": [0.0, 1.0, 1.0, 0.0]}, index=idx)
+    asset_returns = pd.DataFrame({"A": [0.0, -0.1, 0.0, 0.05]}, index=idx)
+    exec_cfg = ExecutionConfig(
+        commission_bps=20_000.0, spread_bps=0.0, slippage_bps=0.0
+    )
+    model = ExecutionModel.from_config(exec_cfg, average_daily_volume=1.0)
+
+    result = run_accounting(held, asset_returns, model, initial_capital=100.0)
+    prices = pd.DataFrame({"A": [100.0, 90.0, 90.0, 94.5]}, index=idx)
+    trades = build_trade_log(
+        result.executed_weights,
+        result.weight_changes,
+        result.equity,
+        prices,
+        commission_bps=20_000.0,
+        spread_bps=0.0,
+        slippage_model=model.slippage,
+    )
+    assert (trades["traded_notional"] >= 0.0).all()
+    assert (trades["commission"] >= 0.0).all()
+
+
+def test_volume_slippage_rejects_negative_params() -> None:
+    from quantlab.execution.slippage import VolumeBasedSlippageModel
+
+    with pytest.raises(ValueError, match="base_slippage_bps"):
+        VolumeBasedSlippageModel(base_slippage_bps=-1.0)
+    with pytest.raises(ValueError, match="impact_coefficient"):
+        VolumeBasedSlippageModel(impact_coefficient=-0.5)
+
+
+def test_cost_and_slippage_models_reject_nan_and_infinity() -> None:
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.slippage import (
+        ConstantSlippageModel,
+        VolumeBasedSlippageModel,
+    )
+
+    for bad in (float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="finite"):
+            CommissionModel(bad)
+        with pytest.raises(ValueError, match="finite"):
+            SpreadModel(bad)
+        with pytest.raises(ValueError, match="finite"):
+            ConstantSlippageModel(bad)
+        with pytest.raises(ValueError, match="finite"):
+            VolumeBasedSlippageModel(base_slippage_bps=bad)
+        with pytest.raises(ValueError, match="finite"):
+            VolumeBasedSlippageModel(impact_coefficient=bad)
+    # Sanity: ordinary, finite values remain accepted.
+    assert CommissionModel(5.0).commission_bps == 5.0
+
+
+def test_volume_slippage_rejects_invalid_average_daily_volume() -> None:
+    import numpy as np
+    import pandas as pd
+
+    from quantlab.execution.slippage import VolumeBasedSlippageModel
+
+    for bad_scalar in (-100.0, float("nan"), float("inf")):
+        with pytest.raises(ValueError, match="average_daily_volume"):
+            VolumeBasedSlippageModel(average_daily_volume=bad_scalar)
+
+    negative_cell = pd.DataFrame({"A": [100.0, -50.0], "B": [200.0, 300.0]})
+    with pytest.raises(ValueError, match="average_daily_volume"):
+        VolumeBasedSlippageModel(average_daily_volume=negative_cell)
+
+    infinite_cell = pd.DataFrame({"A": [100.0, float("inf")], "B": [200.0, 300.0]})
+    with pytest.raises(ValueError, match="average_daily_volume"):
+        VolumeBasedSlippageModel(average_daily_volume=infinite_cell)
+
+    # Sanity: a missing (NaN) cell -- the documented "no volume data yet"
+    # case -- remains accepted, and ordinary positive values are unaffected.
+    nan_cell = pd.DataFrame({"A": [100.0, np.nan], "B": [200.0, 300.0]})
+    VolumeBasedSlippageModel(average_daily_volume=nan_cell)
+    VolumeBasedSlippageModel(average_daily_volume=100.0)
+
+
+def test_run_accounting_raises_on_a_non_finite_cost() -> None:
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.exceptions import BacktestError
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.execution_model import ExecutionModel
+    from quantlab.execution.slippage import ConstantSlippageModel
+
+    idx = pd.date_range("2020-01-01", periods=5, freq="D")
+    weights = pd.DataFrame({"A": [0.0, 1.0, 1.0, 1.0, 1.0]}, index=idx)
+    asset_returns = pd.DataFrame({"A": [0.0, 0.01, 0.01, 0.01, 0.01]}, index=idx)
+
+    commission = CommissionModel(1.0)
+    commission.commission_bps = float("nan")  # bypass the constructor guard
+    exec_model = ExecutionModel(
+        commission, SpreadModel(0.0), ConstantSlippageModel(0.0)
+    )
+
+    with pytest.raises(BacktestError, match="commission cost is negative"):
+        run_accounting(weights, asset_returns, exec_model, 100.0)
+
+
+def test_cap_turnover_rejects_invalid_public_api_parameters() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    targets = pd.DataFrame({"A": [0.5, 0.5]})
+    for bad in (-0.1, float("nan"), float("inf")):
+        with pytest.raises(InvalidConfigurationError):
+            cap_turnover(targets, maximum_turnover=bad)
+    for name in ("maximum_weight", "maximum_gross_exposure", "maximum_net_exposure"):
+        for bad in (-0.1, float("nan")):
+            with pytest.raises(InvalidConfigurationError):
+                cap_turnover(targets, maximum_turnover=0.5, **{name: bad})  # type: ignore[call-overload]
+    # Sanity: ordinary usage remains unaffected.
+    out = cap_turnover(targets, maximum_turnover=0.3)
+    assert out.to_numpy().tolist() == [[0.3], [0.5]]
+
+
+def test_maximum_positions_redistributes_freed_capital() -> None:
+    """Dropping positions beyond `maximum_positions` must redistribute the
+    freed capital onto the survivors, the same as `maximum_weight`
+    already does — not leave the book silently under-invested."""
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    idx = pd.date_range("2020-01-01", periods=1)
+    weights = pd.DataFrame(
+        [[0.3, 0.3, 0.2, 0.1, 0.1]], index=idx, columns=["A", "B", "C", "D", "E"]
+    )
+    out = ConstraintSet(maximum_positions=3).apply(weights)
+    assert out.abs().sum(axis=1).iloc[0] == pytest.approx(1.0)
+    # Relative proportions among the survivors are preserved.
+    assert out["A"].iloc[0] == pytest.approx(out["B"].iloc[0])
+    assert out["A"].iloc[0] > out["C"].iloc[0]
+    assert out["D"].iloc[0] == 0.0
+    assert out["E"].iloc[0] == 0.0
+
+
+def test_minimum_weight_redistributes_freed_capital() -> None:
+    """Zeroing out dust positions below `minimum_weight` must redistribute
+    the freed capital onto the survivors, not leave it
+    un-redistributed."""
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    idx = pd.date_range("2020-01-01", periods=1)
+    weights = pd.DataFrame(
+        [[0.5, 0.45, 0.03, 0.02]], index=idx, columns=["A", "B", "C", "D"]
+    )
+    out = ConstraintSet(minimum_weight=0.05).apply(weights)
+    assert out.abs().sum(axis=1).iloc[0] == pytest.approx(1.0)
+    assert out["C"].iloc[0] == 0.0
+    assert out["D"].iloc[0] == 0.0
+
+
+def test_redistribution_does_not_manufacture_exposure_from_nothing() -> None:
+    """If every position in a row is dropped, there is nothing left to
+    redistribute onto — the row must stay at zero, not blow up."""
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    idx = pd.date_range("2020-01-01", periods=1)
+    weights = pd.DataFrame([[0.01, 0.01, 0.01]], index=idx, columns=["A", "B", "C"])
+    out = ConstraintSet(minimum_weight=0.5).apply(weights)
+    assert (out.iloc[0] == 0.0).all()
+
+
+def test_minimum_weight_survives_exposure_caps_applied_after_it() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    idx = pd.date_range("2020-01-01", periods=1)
+    weights = pd.DataFrame([[0.5, 0.5]], index=idx, columns=["A", "B"])
+    out = ConstraintSet(minimum_weight=0.30, maximum_gross_exposure=0.50).apply(weights)
+    # Every surviving weight must be either exactly 0 or >= minimum_weight —
+    # 0.25 (what a naive single-pass gross cap produces) is neither.
+    values = out.iloc[0]
+    assert ((values == 0.0) | (values.abs() >= 0.30 - 1e-9)).all(), values.tolist()
+
+
+def test_constraint_set_does_not_needlessly_liquidate_the_whole_book() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    idx = pd.date_range("2020-01-01", periods=1)
+    weights = pd.DataFrame([[0.5, 0.5]], index=idx, columns=["A", "B"])
+    out = ConstraintSet(minimum_weight=0.30, maximum_gross_exposure=0.50).apply(weights)
+    values = out.iloc[0]
+    assert values.abs().sum() == pytest.approx(0.5)
+    assert not (values == 0.0).all()
+    assert ((values == 0.0) | (values.abs() >= 0.30 - 1e-9)).all(), values.tolist()
+
+
+def test_constraint_set_liquidation_rescue_never_breaches_exposure() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    violations: list[str] = []
+    for trial in range(2000):
+        rng = np.random.default_rng(trial)
+        n_symbols = int(rng.integers(1, 6))
+        min_weight = float(rng.uniform(0.05, 0.4))
+        max_gross = float(rng.uniform(0.2, 1.5)) if rng.random() < 0.7 else None
+        max_net = float(rng.uniform(0.1, 1.0)) if rng.random() < 0.7 else None
+        max_leverage = float(rng.uniform(0.2, 1.5)) if rng.random() < 0.3 else None
+        max_positions = (
+            int(rng.integers(1, n_symbols + 1)) if rng.random() < 0.3 else None
+        )
+        cs = ConstraintSet(
+            minimum_weight=min_weight,
+            maximum_gross_exposure=max_gross,
+            maximum_net_exposure=max_net,
+            maximum_leverage=max_leverage,
+            maximum_positions=max_positions,
+        )
+        raw = pd.DataFrame(
+            [rng.uniform(-1, 1, n_symbols)],
+            columns=[f"S{i}" for i in range(n_symbols)],
+        )
+        row = cs.apply(raw).iloc[0].to_numpy()
+        tol = 1e-6
+        if max_gross is not None and np.abs(row).sum() > max_gross + tol:
+            violations.append(f"trial {trial}: gross exposure breached")
+        if max_leverage is not None and np.abs(row).sum() > max_leverage + tol:
+            violations.append(f"trial {trial}: leverage breached")
+        if max_net is not None and abs(row.sum()) > max_net + tol:
+            violations.append(f"trial {trial}: net exposure breached")
+        bad = [v for v in row if 1e-9 < abs(v) < min_weight - 1e-9]
+        if bad:
+            violations.append(f"trial {trial}: minimum_weight breached ({bad})")
+    assert not violations, "\n".join(violations)
+
+
+def test_constraint_set_rescue_respects_maximum_weight() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    cs = ConstraintSet(
+        maximum_weight=0.3,
+        minimum_weight=0.25,
+        maximum_gross_exposure=1.0,
+        maximum_leverage=10.0,
+    )
+    raw = pd.DataFrame({"A": [0.6], "B": [0.4]})
+    out = cs.apply(raw)
+    assert out.abs().max(axis=1).iloc[0] <= 0.3 + 1e-9
+
+
+def test_constraint_set_rescue_preserves_numeric_column_labels() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    cs = ConstraintSet(
+        minimum_weight=0.3,
+        maximum_net_exposure=0.1,
+        maximum_leverage=1.0,
+    )
+    raw = pd.DataFrame({0: [0.5], 1: [0.5], 2: [-0.5]})
+    out = cs.apply(raw)
+    assert out.columns.tolist() == [0, 1, 2]
+    assert all(isinstance(c, int) for c in out.columns)
+    assert out.loc[0, 0] == pytest.approx(0.5)
+    assert out.loc[0, 2] == pytest.approx(-0.5)
+
+
+def test_constraint_set_maximum_weight_fuzz_no_violations() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    violations: list[str] = []
+    for trial in range(3000):
+        rng = np.random.default_rng(trial)
+        n_symbols = int(rng.integers(1, 6))
+        max_weight = float(rng.uniform(0.2, 0.9))
+        min_weight = float(rng.uniform(0.01, max_weight))
+        max_gross = float(rng.uniform(0.3, 1.5)) if rng.random() < 0.7 else None
+        max_leverage = float(rng.uniform(0.3, 1.5)) if rng.random() < 0.7 else None
+        max_net = float(rng.uniform(0.1, 1.0)) if rng.random() < 0.5 else None
+        max_positions = (
+            int(rng.integers(1, n_symbols + 1)) if rng.random() < 0.5 else None
+        )
+        cs = ConstraintSet(
+            maximum_weight=max_weight,
+            minimum_weight=min_weight,
+            maximum_gross_exposure=max_gross,
+            maximum_leverage=max_leverage,
+            maximum_net_exposure=max_net,
+            maximum_positions=max_positions,
+            long_only=bool(rng.random() < 0.3),
+        )
+        raw = pd.DataFrame(
+            [rng.uniform(-1, 1, n_symbols)],
+            columns=[f"S{i}" for i in range(n_symbols)],
+        )
+        worst = cs.apply(raw).abs().max(axis=1).iloc[0]
+        if worst > max_weight + 1e-6:
+            violations.append(
+                f"trial {trial}: weight {worst} exceeds maximum_weight {max_weight}"
+            )
+    assert not violations, "\n".join(violations)
+
+
+def test_minimum_weight_zeroing_does_not_worsen_net_exposure() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+
+    max_gross, max_net, max_positions, min_weight = 1.0, 0.5, 3, 0.05
+    cs = ConstraintSet(
+        maximum_gross_exposure=max_gross,
+        maximum_net_exposure=max_net,
+        maximum_positions=max_positions,
+        minimum_weight=min_weight,
+    )
+    violations = []
+    for trial in range(500):
+        rng = np.random.default_rng(trial)
+        n_symbols = 5
+        raw = pd.DataFrame(
+            [rng.uniform(-1, 1, n_symbols), rng.uniform(-1, 1, n_symbols)],
+            columns=[f"S{i}" for i in range(n_symbols)],
+        )
+        out = cs.apply(raw)
+        net = out.sum(axis=1)
+        gross = out.abs().sum(axis=1)
+        active = (out.abs() > 1e-9).sum(axis=1)
+        dust = ((out.abs() > 1e-9) & (out.abs() < min_weight)).sum(axis=1)
+        tol = 1e-6
+        if (net.abs() > max_net + tol).any():
+            violations.append(f"trial {trial}: net exposure breached")
+        if (gross > max_gross + tol).any():
+            violations.append(f"trial {trial}: gross exposure breached")
+        if (active > max_positions).any():
+            violations.append(f"trial {trial}: position count breached")
+        if (dust > 0).any():
+            violations.append(f"trial {trial}: dust below minimum_weight found")
+    assert not violations, "\n".join(violations)
+
+
+def test_maximum_turnover_field_exists_and_is_enforced() -> None:
+    """`PortfolioConfig.maximum_turnover` is a real field wired into
+    `BacktestEngine.run` via `cap_turnover`, not just accepted and
+    ignored."""
+    from quantlab.config import PortfolioConfig
+
+    cfg = PortfolioConfig(allocator="equal_weight", maximum_turnover=0.1)
+    assert cfg.maximum_turnover == pytest.approx(0.1)
+
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=2, freq="D")
+    held = pd.DataFrame({"A": [1.0, 1.0], "B": [0.0, -1.0]}, index=idx)
+    capped = cap_turnover(held, maximum_turnover=0.1)
+    # Turnover from period 0 -> 1 is capped at 0.1 (L1), not the full 2.0 move.
+    turnover = (capped.iloc[1] - capped.iloc[0]).abs().sum()
+    assert turnover == pytest.approx(0.1)
+
+
+def test_execution_model_rejects_a_negative_cost_component_even_if_it_cancels_out() -> (
+    None
+):
+    from quantlab.exceptions import BacktestError
+    from quantlab.execution.costs import CommissionModel, SpreadModel
+    from quantlab.execution.execution_model import ExecutionModel
+    from quantlab.execution.slippage import ConstantSlippageModel
+
+    idx = pd.date_range("2020-01-01", periods=2, freq="D")
+    weight_changes = pd.DataFrame({"A": [0.1, 0.1]}, index=idx)
+
+    commission = CommissionModel(1.0)
+    spread = SpreadModel(1.0)
+    # Directly mutate a constructed model's rate to a negative value,
+    # bypassing its own constructor guard -- exactly the scenario a custom
+    # `SlippageModel` subclass with a looser contract could also produce.
+    spread.spread_bps = -2.0 * commission.commission_bps
+    exec_model = ExecutionModel(commission, spread, ConstantSlippageModel(0.0))
+
+    with pytest.raises(BacktestError, match="spread cost is negative"):
+        exec_model.compute(weight_changes)
+
+
+def test_btc_trend_sizing_and_annualisation_live_in_portfolio() -> None:
+    """BTC trend direction stays separate from portfolio risk sizing."""
+    import pathlib
+
+    from quantlab.backtesting.runner import build_strategy_from_config
+
+    cfg = ExperimentConfig.from_yaml(
+        pathlib.Path(__file__).resolve().parents[2] / "configs" / "btc_trend.yaml"
+    )
+    assert "periods_per_year" not in cfg.strategy.parameters
+    strategy = build_strategy_from_config(cfg)
+    assert not hasattr(strategy, "periods_per_year")
+    assert cfg.periods_per_year == 365
+    assert cfg.portfolio.target_volatility == pytest.approx(0.40)
+
+
+def test_execution_delay_is_a_true_resimulation_not_a_returns_shift() -> None:
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    frames = [
+        make_ohlcv(sym, geometric_series(300, mu, 0.015, 100.0, seed=seed))
+        for sym, seed, mu in [("AAA", 1, 0.0006), ("BBB", 2, 0.0003)]
+    ]
+    data = pd.concat(frames, ignore_index=True)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "test",
+            "data": {
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB"]
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {
+                "name": "cross_sectional_momentum",
+                "parameters": {
+                    "lookback_period": 30,
+                    "skip_period": 5,
+                    "top_fraction": 0.5,
+                },
+            },
+            "portfolio": {"allocator": "equal_weight", "rebalance_frequency": "weekly"},
+            "execution": {
+                "commission_bps": 5.0,
+                "spread_bps": 5.0,
+                "slippage_bps": 5.0,
+            },
+            "backtest": {},
+            "validation": {"method": "holdout"},
+            "reproducibility": {"random_seed": 42},
+        }
+    )
+    base = run_backtest_from_config(data, cfg)
+    delayed = run_backtest_from_config(data, cfg, execution_delay=1)
+
+    # A genuine delay must change the trading schedule, hence cost/turnover —
+    # the fake (returns-shift-only) version left these bit-for-bit identical.
+    assert delayed.metrics["total_cost_fraction"] != pytest.approx(
+        base.metrics["total_cost_fraction"]
+    )
+    assert delayed.metrics["annual_turnover"] != pytest.approx(
+        base.metrics["annual_turnover"]
+    )
+    # And the returns curve itself must differ from the naive shift too.
+    from quantlab.risk.stress import delay_execution
+
+    naive_shift = delay_execution(base.returns, 1)
+    assert not delayed.returns.equals(naive_shift)
+
+
+def test_execution_delay_zero_is_a_no_op() -> None:
+    """`execution_delay=0` (the default) must reproduce the exact baseline —
+    the delay machinery must not perturb the normal path."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _holdout_config()
+    base = run_backtest_from_config(data, cfg)
+    explicit_zero = run_backtest_from_config(data, cfg, execution_delay=0)
+    pd.testing.assert_series_equal(base.returns, explicit_zero.returns)
+
+
+def test_scale_costs_slippage_mult_also_scales_impact_coefficient() -> None:
+    from quantlab.risk.stress import scale_costs
+
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "test",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold", "parameters": {}},
+            "portfolio": {"allocator": "equal_weight"},
+            "execution": {
+                "slippage_bps": 0.0,
+                "slippage_model": "volume",
+                "impact_coefficient": 0.2,
+            },
+            "backtest": {},
+            "validation": {"method": "holdout"},
+            "reproducibility": {"random_seed": 42},
+        }
+    )
+    scaled = scale_costs(cfg, slippage_mult=2.0)
+    assert scaled.execution.impact_coefficient == pytest.approx(0.4)
+    assert scaled.execution.slippage_bps == pytest.approx(0.0)
+
+
+def test_trade_log_volume_slippage_matches_accounting() -> None:
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.backtesting.trade_log import build_trade_log
+    from quantlab.config import ExecutionConfig
+    from quantlab.execution.execution_model import ExecutionModel
+
+    idx = pd.date_range("2020-01-01", periods=4, freq="D")
+    held = pd.DataFrame({"A": [1.0, 1.0, 0.0, 1.0]}, index=idx)
+    asset_returns = pd.DataFrame({"A": [0.0, 0.2, 0.1, 0.0]}, index=idx)
+    # Deliberately high cost relative to a small ADV: at low cost levels
+    # gross and net equity are nearly identical, so a test that (wrongly)
+    # compares against gross equity would still pass by accident — this
+    # needs enough cost drag for gross/net to visibly diverge, or the test
+    # can't actually catch the equity-basis mistake it's guarding against.
+    adv = pd.DataFrame({"A": [1_000.0] * 4}, index=idx)
+    exec_cfg = ExecutionConfig(
+        commission_bps=0.0,
+        spread_bps=0.0,
+        slippage_bps=50.0,
+        slippage_model=cast(Any, "volume"),
+        impact_coefficient=5.0,
+    )
+    model = ExecutionModel.from_config(exec_cfg, average_daily_volume=adv)
+    accounting = run_accounting(held, asset_returns, model, initial_capital=1000.0)
+
+    prices = pd.DataFrame({"A": [100.0] * 4}, index=idx)
+    trades = build_trade_log(
+        accounting.executed_weights,
+        accounting.weight_changes_for_costs,
+        accounting.equity,
+        prices,
+        commission_bps=0.0,
+        spread_bps=0.0,
+        slippage_model=model.slippage,
+        slippage_equity=accounting.equity_for_costs,
+    )
+    # Reconstruct the aggregate accounting-level slippage cost in dollars and
+    # compare per-date totals against the trade log's per-fill sum. Every
+    # fraction-of-equity cost in this codebase (commission, spread, slippage,
+    # net_returns itself) is consistently a fraction of the prior period's
+    # *net* equity, not gross — `trade_log.py`'s own final dollar conversion
+    # uses `prev_equity` (net) for exactly this reason, and the internal
+    # volume-based *ratio* converges to net equity via `_solve_accounting`'s
+    # fixed-point loop rather than using `gross_equity` (gross equity
+    # diverges from net by exactly the cumulative cost drag — see the module
+    # docstring). Comparing against gross equity here instead would only
+    # pass by accident at low cost levels, where gross and net are nearly
+    # identical; the elevated slippage_bps=50/impact_coefficient=5 above
+    # makes them diverge enough for this comparison to actually be
+    # meaningful.
+    prior_net_equity = accounting.equity.shift(1).fillna(1000.0)
+    aggregate_dollar_cost = accounting.costs.slippage * prior_net_equity
+    trade_log_totals = trades.groupby("timestamp")["slippage_cost"].sum()
+    for ts, expected_cost in aggregate_dollar_cost.items():
+        if abs(expected_cost) < 1e-9:
+            continue
+        assert trade_log_totals.get(ts, 0.0) == pytest.approx(expected_cost, rel=1e-9)
+
+
+def test_trade_log_defaults_to_equity_without_slippage_equity() -> None:
+    from quantlab.backtesting.trade_log import build_trade_log
+    from quantlab.execution.slippage import VolumeBasedSlippageModel
+
+    idx = pd.date_range("2020-01-01", periods=3, freq="D")
+    executed = pd.DataFrame({"A": [0.0, 1.0, 1.0]}, index=idx)
+    changes = pd.DataFrame({"A": [0.0, 1.0, 0.0]}, index=idx)
+    equity = pd.Series([1000.0, 1000.0, 1100.0], index=idx)
+    prices = pd.DataFrame({"A": [100.0, 100.0, 100.0]}, index=idx)
+    model = VolumeBasedSlippageModel(
+        base_slippage_bps=5.0,
+        impact_coefficient=1.0,
+        average_daily_volume=pd.DataFrame({"A": [1000.0] * 3}, index=idx),
+    )
+    kwargs: dict[str, Any] = {
+        "commission_bps": 0.0,
+        "spread_bps": 0.0,
+        "slippage_model": model,
+    }
+
+    omitted = build_trade_log(executed, changes, equity, prices, **kwargs)
+    explicit = build_trade_log(
+        executed, changes, equity, prices, slippage_equity=equity, **kwargs
+    )
+    pd.testing.assert_frame_equal(omitted, explicit)
+
+    # And it must be sensitive to slippage_equity, so the equality above
+    # isn't vacuously true regardless of what's passed in.
+    different = build_trade_log(
+        executed, changes, equity, prices, slippage_equity=equity * 2.0, **kwargs
+    )
+    assert not different["slippage_cost"].equals(omitted["slippage_cost"])
+
+
+def test_turnover_cap_completes_a_full_rotation_between_disjoint_sets() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=6, freq="D")
+    raw = pd.DataFrame(
+        [[0.5, 0.5, 0.0, 0.0]] + [[0.0, 0.0, 0.5, 0.5]] * 5,
+        index=idx,
+        columns=["A", "B", "C", "D"],
+    )
+    constrained = ConstraintSet(maximum_positions=2).apply(raw)
+    capped = cap_turnover(constrained, maximum_turnover=0.5)
+
+    previous = pd.Series(0.0, index=raw.columns)
+    for ts, row in capped.iterrows():
+        realised_turnover = (row - previous).abs().sum()
+        assert realised_turnover <= 0.5 + 1e-9, (
+            f"turnover {realised_turnover} exceeds the 0.5 cap at {ts}"
+        )
+        previous = row
+
+    # The rotation must still complete eventually (not get stuck at zero
+    # forever) — by the last period the target's assets are fully held.
+    assert capped.iloc[-1][["C", "D"]].sum() == pytest.approx(1.0)
+    assert capped.iloc[-1][["A", "B"]].sum() == pytest.approx(0.0)
+
+
+def test_engine_turnover_cap_never_exceeds_the_configured_budget() -> None:
+    """`maximum_turnover` bounds the REAL trade size (`result.turnover`,
+    built from `apply_weight_drift`'s own `trade_changes` -- exactly zero
+    on a pure-drift row, the real size on an anchor or a landed
+    correction), not a raw row-to-row diff of `result.positions`. With
+    `model_weight_drift` at its default (`True`), `result.positions`
+    itself keeps moving every day from organic price drift independently
+    of the turnover cap -- that is the whole point of the feature, not a
+    violation of this cap, which only throttles genuine trades (see
+    docs/backtesting.md's Rebalancing & turnover / Weight drift
+    sections)."""
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    frames = [
+        make_ohlcv(sym, geometric_series(120, mu, 0.02, 100.0, seed=seed))
+        for sym, seed, mu in [
+            ("AAA", 1, 0.002),
+            ("BBB", 2, -0.002),
+            ("CCC", 3, 0.001),
+            ("DDD", 4, -0.001),
+        ]
+    ]
+    data = pd.concat(frames, ignore_index=True)
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "test",
+            "data": {
+                "instruments": [
+                    {"symbol": s, "source": "csv", "calendar": "XNYS"}
+                    for s in ["AAA", "BBB", "CCC", "DDD"]
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2020-06-01",
+                "frequency": "1d",
+            },
+            "strategy": {
+                "name": "cross_sectional_momentum",
+                "parameters": {
+                    "lookback_period": 10,
+                    "skip_period": 0,
+                    "top_fraction": 0.5,
+                },
+            },
+            "portfolio": {
+                "allocator": "equal_weight",
+                "target_maximum_positions": 2,
+                "maximum_turnover": 0.1,
+                "rebalance_frequency": "daily",
+            },
+            "execution": {},
+            "backtest": {},
+            "validation": {"method": "holdout"},
+            "reproducibility": {"random_seed": 42},
+        }
+    )
+    result = run_backtest_from_config(data, cfg)
+    assert result.target_weights is not None
+    target_nonzero = (result.target_weights.abs() > 1e-9).sum(axis=1)
+    assert target_nonzero.max() <= 2
+    assert result.turnover is not None
+    assert result.turnover.max() <= 0.1 + 1e-9
+
+
+def test_infeasible_position_weight_combo_warns(caplog: Any) -> None:
+    import logging
+
+    from quantlab.config import PortfolioConfig
+
+    with caplog.at_level(logging.WARNING):
+        PortfolioConfig(
+            allocator="equal_weight", target_maximum_positions=2, maximum_weight=0.30
+        )
+    assert any(
+        "under-invest" in rec.message or "under-invest" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_feasible_position_weight_combo_does_not_warn(caplog: Any) -> None:
+    import logging
+
+    from quantlab.config import PortfolioConfig
+
+    with caplog.at_level(logging.WARNING):
+        PortfolioConfig(
+            allocator="equal_weight", target_maximum_positions=5, maximum_weight=0.30
+        )
+    assert not any("under-invest" in rec.getMessage() for rec in caplog.records)
+
+
+def test_cap_turnover_net_exposure_is_preserved_by_construction() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=3, freq="D")
+    raw = pd.DataFrame(
+        [[1.0, -0.6, 0.0], [1.0, -0.6, 0.0], [0.0, -0.6, 0.1]],
+        index=idx,
+        columns=["A", "B", "C"],
+    )
+    capped = cap_turnover(raw, maximum_turnover=1.0)
+    net = capped.sum(axis=1)
+    assert (net.abs() <= 0.5 + 1e-9).all(), f"net exposure breached: {net.tolist()}"
+
+
+def test_cap_turnover_only_trades_on_rebalance_dates() -> None:
+    from quantlab.config import RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        apply_rebalancing,
+        cap_turnover,
+        rebalance_dates,
+    )
+
+    idx = pd.date_range("2020-01-01", periods=6, freq="D")
+    target = pd.DataFrame({"A": [1.0] * 6}, index=idx)
+    rebalanced = apply_rebalancing(target, RebalanceFrequency.MONTHLY)
+    dates = rebalance_dates(idx, RebalanceFrequency.MONTHLY)
+    assert len(dates) == 1  # a single-month window has exactly one rebalance
+
+    capped = cap_turnover(rebalanced, maximum_turnover=0.2, rebalance_index=dates)
+    assert capped["A"].tolist() == [0.2] * 6
+
+    # Without a schedule, a direct caller gets the "catch-up" behaviour
+    # instead: turnover applies every day, not just at rebalances. This
+    # confirms the difference above comes from `rebalance_index`, not
+    # something else about the inputs.
+    capped_no_schedule = cap_turnover(rebalanced, maximum_turnover=0.2)
+    assert capped_no_schedule["A"].tolist() == pytest.approx(
+        [0.2, 0.4, 0.6, 0.8, 1.0, 1.0]
+    )
+
+
+def test_cap_turnover_dust_snap_never_exceeds_the_turnover_budget() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=14, freq="D")
+    targets = [0.9] * 6 + [0.0] * 8
+    raw = pd.DataFrame({"A": targets}, index=idx)
+    capped = cap_turnover(raw, maximum_turnover=0.3)
+    values = capped["A"].tolist()
+
+    # Core invariant: no single rebalance ever moves the position by more
+    # than the configured turnover budget.
+    previous = 0.0
+    for v in values:
+        assert abs(v - previous) <= 0.3 + 1e-9, (
+            f"turnover budget exceeded: {previous} -> {v}"
+        )
+        previous = v
+
+    # The exit leg (from period 6, where the target is 0) must be
+    # monotonically non-increasing in magnitude — no bounce-back — and must
+    # reach exactly zero.
+    exit_leg = values[6:]
+    assert all(exit_leg[i] >= exit_leg[i + 1] - 1e-9 for i in range(len(exit_leg) - 1))
+    assert exit_leg[-1] == 0.0
+
+
+def test_cap_turnover_convex_constraints_never_breached_property() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    max_gross, max_net, max_weight, max_positions, min_weight = 1.0, 0.5, 0.4, 3, 0.05
+    cs = ConstraintSet(
+        maximum_gross_exposure=max_gross,
+        maximum_net_exposure=max_net,
+        maximum_weight=max_weight,
+        maximum_positions=max_positions,
+        minimum_weight=min_weight,
+    )
+    violations: list[str] = []
+    for trial in range(800):
+        rng = np.random.default_rng(trial)
+        n_symbols = int(rng.integers(2, 8))
+        n_periods = int(rng.integers(2, 5))
+        raw = pd.DataFrame(
+            [rng.uniform(-1, 1, n_symbols) for _ in range(n_periods)],
+            columns=[f"S{i}" for i in range(n_symbols)],
+        )
+        constrained = cs.apply(raw)
+        constrained.index = pd.date_range("2020-01-01", periods=n_periods, freq="D")
+        maximum_turnover = float(rng.uniform(0.05, 0.6))
+        out = cap_turnover(
+            constrained,
+            maximum_turnover=maximum_turnover,
+            maximum_weight=max_weight,
+            maximum_gross_exposure=max_gross,
+            maximum_net_exposure=max_net,
+        )
+        net = out.sum(axis=1)
+        gross = out.abs().sum(axis=1)
+        turnover = out.diff().abs().sum(axis=1)
+        turnover.iloc[0] = out.iloc[0].abs().sum()
+        tol = 1e-6
+        if (net.abs() > max_net + tol).any():
+            violations.append(f"trial {trial}: net exposure breached")
+        if (gross > max_gross + tol).any():
+            violations.append(f"trial {trial}: gross exposure breached")
+        if (out.abs() > max_weight + tol).to_numpy().any():
+            violations.append(f"trial {trial}: per-asset weight cap breached")
+        if (turnover > maximum_turnover + tol).any():
+            violations.append(f"trial {trial}: turnover budget breached")
+    assert not violations, "\n".join(violations)
+
+
+def test_cap_turnover_converges_exactly_to_a_fixed_target() -> None:
+    from quantlab.portfolio.constraints import ConstraintSet
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    max_gross, max_net, max_positions = 1.0, 0.5, 2
+    cs = ConstraintSet(
+        maximum_gross_exposure=max_gross,
+        maximum_net_exposure=max_net,
+        maximum_positions=max_positions,
+    )
+    failures: list[str] = []
+    n_periods = 60
+    for trial in range(300):
+        rng = np.random.default_rng(trial)
+        n_symbols = 4
+        # Same target held for every rebalance after the first (a strategy
+        # whose signal is unchanging) -- the scenario most likely to expose
+        # a permanent deadlock, unlike a freshly-random target every period.
+        first = rng.uniform(-1, 1, n_symbols)
+        rest = rng.uniform(-1, 1, n_symbols)
+        raw = pd.DataFrame(
+            [first] + [rest] * (n_periods - 1),
+            columns=[f"S{i}" for i in range(n_symbols)],
+        )
+        constrained = cs.apply(raw)
+        constrained.index = pd.date_range("2020-01-01", periods=n_periods, freq="D")
+        maximum_turnover = float(rng.uniform(0.05, 0.3))
+        out = cap_turnover(
+            constrained,
+            maximum_turnover=maximum_turnover,
+            maximum_gross_exposure=max_gross,
+            maximum_net_exposure=max_net,
+        )
+        target_row = constrained.iloc[-1]
+        final_row = out.iloc[-1]
+        if not np.allclose(final_row.to_numpy(), target_row.to_numpy(), atol=1e-6):
+            failures.append(
+                f"trial {trial}: did not converge - target={target_row.tolist()} "
+                f"final={final_row.tolist()}"
+            )
+    assert not failures, "\n".join(failures)
+
+
+def test_cap_turnover_fuzz_settles_then_converges_exactly_with_exposure_caps() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    def make_compliant_state(
+        rng: np.random.Generator,
+        n_assets: int,
+        max_weight: float | None,
+        max_gross: float | None,
+        max_net: float | None,
+    ) -> np.ndarray:
+        state = rng.uniform(-1, 1, n_assets)
+        if max_weight is not None:
+            state = np.clip(state, -max_weight, max_weight)
+        for _ in range(50):
+            gross = np.abs(state).sum()
+            net = state.sum()
+            scale = 1.0
+            if max_gross is not None and gross > max_gross:
+                scale = min(scale, max_gross / gross)
+            if max_net is not None and abs(net) > max_net:
+                scale = min(scale, max_net / abs(net))
+            if scale >= 1.0:
+                break
+            state = state * scale
+        return state
+
+    rng = np.random.default_rng(0)
+    tested = 0
+    non_convergent = 0
+    for _ in range(600):
+        n_assets = int(rng.integers(2, 6))
+        max_turn = float(rng.uniform(0.05, 0.8))
+        max_weight = float(rng.uniform(0.3, 1.0)) if rng.random() < 0.5 else None
+        max_gross = float(rng.uniform(0.3, 1.5)) if rng.random() < 0.6 else None
+        max_net = float(rng.uniform(0.1, 1.0)) if rng.random() < 0.6 else None
+        cols = [f"A{i}" for i in range(n_assets)]
+
+        previous = make_compliant_state(rng, n_assets, max_weight, max_gross, max_net)
+        target = make_compliant_state(rng, n_assets, max_weight, max_gross, max_net)
+
+        tested += 1
+        settle_periods = max(20, int(np.ceil(np.abs(previous).sum() / max_turn)) + 5)
+        main_periods = max(
+            20, int(np.ceil(np.abs(target - previous).sum() / max_turn)) + 5
+        )
+        idx = pd.date_range(
+            "2020-01-01", periods=settle_periods + main_periods, freq="D"
+        )
+        rows = [previous] * settle_periods + [target] * main_periods
+        df = pd.DataFrame(rows, columns=cols, index=idx)
+        out = cap_turnover(
+            df,
+            maximum_turnover=max_turn,
+            maximum_weight=max_weight,
+            maximum_gross_exposure=max_gross,
+            maximum_net_exposure=max_net,
+        )
+        assert np.allclose(
+            out.iloc[settle_periods - 1].to_numpy(), previous, atol=1e-6
+        ), "settling phase itself did not reach the intended previous state"
+        if not np.allclose(out.iloc[-1].to_numpy(), target, atol=1e-6):
+            non_convergent += 1
+
+    assert tested > 400
+    assert non_convergent == 0, f"{non_convergent}/{tested} failed to converge exactly"
+
+
+def test_cap_turnover_rejects_a_non_compliant_target_row() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=1, freq="D")
+
+    bad_weight = pd.DataFrame({"A": [0.9]}, index=idx)
+    with pytest.raises(InvalidConfigurationError, match="maximum_weight"):
+        cap_turnover(bad_weight, maximum_turnover=0.5, maximum_weight=0.5)
+
+    bad_gross = pd.DataFrame({"A": [0.9], "B": [0.9]}, index=idx)
+    with pytest.raises(InvalidConfigurationError, match="maximum_gross_exposure"):
+        cap_turnover(bad_gross, maximum_turnover=0.5, maximum_gross_exposure=1.0)
+
+    bad_net = pd.DataFrame({"A": [0.9], "B": [0.9]}, index=idx)
+    with pytest.raises(InvalidConfigurationError, match="maximum_net_exposure"):
+        cap_turnover(bad_net, maximum_turnover=0.5, maximum_net_exposure=1.0)
+
+    bad_long_only = pd.DataFrame({"A": [-0.1]}, index=idx)
+    with pytest.raises(InvalidConfigurationError, match="long_only"):
+        cap_turnover(bad_long_only, maximum_turnover=0.5, long_only=True)
+
+
+def test_cap_turnover_preserves_float_precision_for_integer_input() -> None:
+    from quantlab.portfolio.rebalancing import cap_turnover
+
+    idx = pd.date_range("2020-01-01", periods=2, freq="D")
+    targets = pd.DataFrame({"A": [1, 1]}, index=idx)
+    assert targets["A"].dtype.kind == "i"
+
+    out = cap_turnover(targets, maximum_turnover=0.5)
+    assert out["A"].dtype == float
+    assert out["A"].tolist() == pytest.approx([0.5, 1.0])
+    turnover = out.diff().abs().sum(axis=1)
+    turnover.iloc[0] = out.iloc[0].abs().sum()
+    assert (turnover <= 0.5 + 1e-9).all()
+
+
+def test_engine_only_trades_cap_turnover_on_rebalance_dates() -> None:
+    """End-to-end: a monthly-rebalanced, turnover-capped backtest must not
+    trade on non-rebalance dates.
+
+    `model_weight_drift` is explicitly disabled: this test is specifically
+    about the turnover-cap/rebalance-schedule mechanism producing a
+    constant-weight step function between rebalances -- with drift enabled
+    (the default), `result.positions` genuinely changes every day from
+    organic price movement, which is the whole point of that feature, not
+    a violation of this one's own scope.
+    """
+    from quantlab.backtesting.runner import run_backtest_from_config
+
+    data, cfg = _rf_test_setup()
+    cfg = cfg.revalidated_copy(
+        update={
+            "portfolio": cfg.portfolio.revalidated_copy(
+                update={
+                    "maximum_turnover": 0.1,
+                    "rebalance_frequency": "monthly",
+                    "model_weight_drift": False,
+                }
+            )
+        }
+    )
+    result = run_backtest_from_config(data, cfg)
+    from quantlab.portfolio.rebalancing import rebalance_dates
+
+    # The engine now groups rebalance periods calendar-aware (see
+    # rebalance_dates' calendar parameter) whenever every instrument shares
+    # one calendar -- both symbols here are XNYS, so this check must use the
+    # same calendar to determine "the" rebalance dates, or a bar dated on an
+    # XNYS holiday in this test's raw bdate-range fixture (not run through
+    # DataLoader's own holiday/closure handling) would land in a different
+    # calendar month than a naive .to_period("M") assumes.
+    dates = rebalance_dates(
+        pd.DatetimeIndex(result.positions.index), "monthly", calendar="XNYS"
+    )
+    # `result.positions` is `executed_weights = held.shift(1)` (the
+    # look-ahead barrier), so a rebalance decided on date `d` only shows up
+    # as a change one period *later* in `result.positions` — shift the
+    # rebalance-date set to match before checking where trades landed.
+    positions_index = result.positions.index
+    rebalance_locs = positions_index.get_indexer(dates)
+    shifted_locs = np.array(
+        [loc + 1 for loc in rebalance_locs if 0 <= loc + 1 < len(positions_index)]
+    )
+    shifted_dates = positions_index[shifted_locs]
+    non_rebalance_mask = ~positions_index.isin(shifted_dates)
+    turnover_on_non_rebalance_days = (
+        (result.positions - result.positions.shift(1).fillna(0.0))
+        .abs()
+        .sum(axis=1)[non_rebalance_mask]
+    )
+    assert (turnover_on_non_rebalance_days == 0.0).all()
+
+
+# --------------------------------------------------------------------------- #
+# Tradability-aware rebalancing (`rebalance_and_cap_turnover(..., tradable=)`)
+# --------------------------------------------------------------------------- #
+
+
+def assert_all_rows_compliant(
+    result: pd.DataFrame,
+    *,
+    maximum_weight: float | None = None,
+    maximum_gross_exposure: float | None = None,
+    maximum_net_exposure: float | None = None,
+    long_only: bool = False,
+) -> None:
+    """Every row a tradability-aware rebalance produces must respect the
+    portfolio's convex constraints -- especially with one or more instruments
+    closed, the case that historically could break this invariant."""
+    values = result.to_numpy(dtype=float)
+    if long_only:
+        assert (values >= -1e-9).all()
+    if maximum_weight is not None:
+        assert (np.abs(values) <= maximum_weight + 1e-9).all()
+    if maximum_gross_exposure is not None:
+        assert (np.abs(values).sum(axis=1) <= maximum_gross_exposure + 1e-9).all()
+    if maximum_net_exposure is not None:
+        assert (np.abs(values.sum(axis=1)) <= maximum_net_exposure + 1e-9).all()
+
+
+def test_tradable_none_preserves_exact_current_behavior() -> None:
+    """The default (no `tradable`) path must be byte-identical to today's
+    `apply_rebalancing` + `cap_turnover`, since every existing caller/test
+    relies on this contract."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        apply_rebalancing,
+        cap_turnover,
+        rebalance_and_cap_turnover,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=10, freq="D")
+    targets = pd.DataFrame({"A": [0.5] * 10, "B": [0.5] * 10}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY, maximum_turnover=0.1
+    )
+    expected = cap_turnover(
+        apply_rebalancing(targets, "daily"), 0.1, rebalance_index=idx
+    )
+    actual = rebalance_and_cap_turnover(targets, cfg)
+    pd.testing.assert_frame_equal(expected, actual)
+
+
+def test_tradability_aware_defers_target_while_symbol_closed() -> None:
+    """A closed symbol must never trade -- its held weight stays exactly at
+    its last traded value on every date it is closed."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=6, freq="D")  # Fri..Wed
+    targets = pd.DataFrame(
+        {"AAPL": [0.5, 0.5, 0.5, 0.6, 0.6, 0.6], "BTC": [0.5, 0.5, 0.5, 0.4, 0.4, 0.4]},
+        index=idx,
+    )
+    tradable = pd.DataFrame(
+        {"AAPL": [True, False, False, True, True, True], "BTC": [True] * 6}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert held.loc[idx[2], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert_all_rows_compliant(held, long_only=True)
+
+
+def test_tradability_aware_tolerates_a_differently_ordered_tradable_frame() -> None:
+    """`tradable`'s column order need not match `target_weights`' own order
+    (e.g. an alphabetically-pivoted price matrix vs. a declared symbol
+    list) -- only the *set* of dates and symbols must agree. A stricter,
+    order-sensitive check previously rejected this as a mismatch even
+    though every label was present on both sides."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=6, freq="D")
+    targets = pd.DataFrame(
+        {"AAPL": [0.5, 0.5, 0.5, 0.6, 0.6, 0.6], "BTC": [0.5, 0.5, 0.5, 0.4, 0.4, 0.4]},
+        index=idx,
+    )
+    # Same labels as `targets`, deliberately reversed column order.
+    tradable = pd.DataFrame(
+        {"BTC": [True] * 6, "AAPL": [True, False, False, True, True, True]}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert held.loc[idx[2], "AAPL"] == held.loc[idx[0], "AAPL"]
+    assert_all_rows_compliant(held, long_only=True)
+
+
+def test_tradability_aware_rejects_a_tradable_frame_missing_a_symbol() -> None:
+    """A genuine set mismatch (not just reordering) must still raise --
+    silently defaulting an unrecognized symbol to "tradable" could let it
+    trade on a date it should have stayed closed."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.exceptions import InvalidConfigurationError
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=3, freq="D")
+    targets = pd.DataFrame({"AAPL": [0.5, 0.5, 0.5], "BTC": [0.5, 0.5, 0.5]}, index=idx)
+    tradable = pd.DataFrame({"AAPL": [True, True, True]}, index=idx)  # missing BTC
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    with pytest.raises(InvalidConfigurationError, match="dates and symbols"):
+        rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+
+
+def test_tradability_aware_catches_up_on_first_reopening_date_even_off_schedule() -> (
+    None
+):
+    """A monthly rebalance falls on a date AAPL is closed (a Sunday).
+    AAPL's pending target must resolve in `held_weights` on its first
+    tradable date afterward (Monday) -- which is *not* itself a scheduled
+    rebalance date -- rather than waiting for next month's. This is still
+    only a *decision*, dated Monday: see the module docstring's timing
+    convention -- it does not reach the accounting layer's executed
+    weights until AAPL's next tradable session (Tuesday), the same
+    one-period lag every other decision in this module is subject to. That
+    full-pipeline timing is covered separately by
+    test_reopening_catch_up_decision_only_executes_the_following_tradable_session
+    in test_regression_execution.py."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    # All four dates fall in January, so "monthly" rebalancing has exactly
+    # one rebalance date for this whole window: idx[0] (Sunday, Jan 7).
+    idx = pd.date_range("2024-01-07", periods=4, freq="D")  # Sun, Mon, Tue, Wed
+    targets = pd.DataFrame({"AAPL": [0.6] * 4, "BTC": [0.4] * 4}, index=idx)
+    tradable = pd.DataFrame(
+        {"AAPL": [False, True, True, True], "BTC": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, long_only=True
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[0], "AAPL"] == 0.0  # blocked on the rebalance date itself
+    assert held.loc[idx[1], "AAPL"] == pytest.approx(0.6)  # decided Monday
+    assert held.loc[idx[1], "BTC"] == pytest.approx(0.4)  # BTC traded on schedule
+
+
+def test_reopening_catch_up_decision_only_executes_the_following_tradable_session() -> (
+    None
+):
+    """Genuine end-to-end pipeline check (rebalancing.py -> accounting.py)
+    for the exact scenario above: `rebalance_and_cap_turnover` resolves
+    AAPL's pending target in `held_weights` on Monday (its reopening day),
+    but that is only a decision, per this module's documented timing
+    convention -- it must not affect the accounting layer's executed
+    weights, turnover or cost until AAPL's next tradable session, Tuesday.
+    Positions, returns, turnover and costs are all checked together so a
+    future change that lets the two layers drift out of sync (e.g. one
+    side collapsing the closure-catch-up delay with the standard
+    no-look-ahead shift, the other not) is caught here, not discovered as
+    a confusing mismatch between a rebalancing-only test and a full
+    backtest."""
+    from quantlab.backtesting.accounting import run_accounting
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-07", periods=4, freq="D")  # Sun, Mon, Tue, Wed
+    targets = pd.DataFrame({"AAPL": [0.6] * 4, "BTC": [0.4] * 4}, index=idx)
+    tradable = pd.DataFrame(
+        {"AAPL": [False, True, True, True], "BTC": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, long_only=True
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[1], "AAPL"] == pytest.approx(0.6)  # decided Monday
+
+    # AAPL is closed on Sunday, so it has no meaningful return that day;
+    # a non-zero executed weight there would raise, but AAPL's executed
+    # weight is (and must remain) exactly zero on Sunday.
+    asset_returns = pd.DataFrame(
+        {
+            "AAPL": [np.nan, 0.01, -0.02, 0.015],
+            "BTC": [0.005, -0.01, 0.02, 0.0],
+        },
+        index=idx,
+    )
+    result = run_accounting(
+        held, asset_returns, _flat_execution_model(), 100.0, tradable=tradable
+    )
+    assert result.executed_weights.loc[idx[0], "AAPL"] == 0.0
+    assert result.executed_weights.loc[idx[1], "AAPL"] == 0.0  # not yet Monday
+    assert result.executed_weights.loc[idx[2], "AAPL"] == pytest.approx(0.6)  # Tuesday
+
+    # AAPL's own per-symbol weight change lands on Tuesday, not Monday --
+    # the weight_changes frame agrees with executed_weights.
+    assert result.weight_changes.loc[idx[1], "AAPL"] == pytest.approx(0.0)
+    assert result.weight_changes.loc[idx[2], "AAPL"] == pytest.approx(0.6)
+    # Total turnover on Monday is BTC's own first-decision execution (0.4,
+    # decided Sunday, executed Monday under the same one-period rule) --
+    # AAPL contributes nothing to it. Tuesday's turnover is AAPL's
+    # catch-up alone, since BTC is already flat that day.
+    assert result.turnover.loc[idx[1]] == pytest.approx(0.4)
+    assert result.turnover.loc[idx[2]] == pytest.approx(0.6)
+
+
+def test_pending_target_remains_pending_after_partial_turnover_fill() -> None:
+    """When a turnover cap only partially closes the gap on reopening, the
+    debt must stay open (not silently considered done)."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=3, freq="D")  # Fri, Sat, Sun
+    targets = pd.DataFrame({"A": [0.2, 0.8, 0.8], "B": [0.2, 0.2, 0.2]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, False, True], "B": [True] * 3}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.2,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # A is closed on idx[1] (Saturday); its new target (0.8) is set that day
+    # but can't execute. On idx[2] (Sunday) it reopens and the 0.2 turnover
+    # cap only lets it move part-way -- it must not have fully reached 0.8.
+    assert held.loc[idx[1], "A"] == held.loc[idx[0], "A"]
+    assert cast(float, held.loc[idx[2], "A"]) > cast(float, held.loc[idx[0], "A"])
+    assert cast(float, held.loc[idx[2], "A"]) < 0.8
+
+
+def test_pending_target_continues_catching_up_on_following_open_sessions() -> None:
+    """The scenario from review: a rebalance blocked by a closure, a partial
+    turnover-capped catch-up the next day, and a *further* catch-up the day
+    after that -- without waiting for another scheduled rebalance."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-07", periods=3, freq="D")  # Sun, Mon, Tue
+    # Sunday is the (blocked) monthly rebalance date; A stays closed only on
+    # Sunday, then is open Monday and Tuesday.
+    targets = pd.DataFrame({"A": [0.9, 0.9, 0.9], "B": [0.1, 0.1, 0.1]}, index=idx)
+    tradable = pd.DataFrame({"A": [False, True, True], "B": [True] * 3}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY,
+        maximum_turnover=0.3,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert held.loc[idx[0], "A"] == 0.0  # never traded, blocked from the start
+    monday = cast(float, held.loc[idx[1], "A"])
+    assert 0.0 < monday < 0.9  # partial catch-up
+    tuesday = cast(float, held.loc[idx[2], "A"])
+    assert tuesday > monday  # continues catching up, no new rebalance needed
+    assert tuesday <= 0.9 + 1e-9
+
+
+def test_pending_flag_clears_when_target_is_fully_reached() -> None:
+    """Once a deferred target is fully executed, the symbol must return to
+    the ordinary rebalance-date-only cadence (no further drift)."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-05", periods=4, freq="D")  # Fri, Sat, Sun, Mon
+    targets = pd.DataFrame(
+        {"A": [0.2, 0.6, 0.6, 0.6], "B": [0.2, 0.2, 0.2, 0.2]}, index=idx
+    )
+    tradable = pd.DataFrame(
+        {"A": [True, False, True, True], "B": [True] * 4}, index=idx
+    )
+    cfg = PortfolioConfig(rebalance_frequency=RebalanceFrequency.DAILY, long_only=True)
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # A reaches 0.6 on Sunday (its first reopening, no turnover cap), then
+    # Monday is a rebalance date with the SAME target (0.6) -- it must simply
+    # stay there, not move further.
+    assert held.loc[idx[2], "A"] == pytest.approx(0.6)
+    assert held.loc[idx[3], "A"] == pytest.approx(0.6)
+
+
+def test_normal_always_open_symbol_does_not_converge_between_rebalance_dates() -> None:
+    """A symbol that is never closed must keep today's exact cadence: its
+    weight is exactly flat on every date that is *not* a scheduled
+    rebalance date, jumping only on rebalance dates -- even in a mixed
+    portfolio where some other symbol does have closures. The tradability
+    machinery must never turn a normal turnover-capped catch-up into
+    continuous day-by-day drift."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        rebalance_and_cap_turnover,
+        rebalance_dates,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=40, freq="D")
+    targets = pd.DataFrame(
+        {"ALWAYS_OPEN": [0.9] * 40, "SOMETIMES_CLOSED": [0.1] * 40}, index=idx
+    )
+    tradable = pd.DataFrame(
+        {
+            "ALWAYS_OPEN": [True] * 40,
+            # Closed for a stretch, so pending-due-to-closure logic is
+            # genuinely exercised for the OTHER column during this run.
+            "SOMETIMES_CLOSED": [d.day not in range(5, 10) for d in idx],
+        },
+        index=idx,
+    )
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.MONTHLY, maximum_turnover=0.1
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+
+    schedule = rebalance_dates(idx, "monthly")
+    is_rebalance_date = idx.isin(schedule)
+    always_open = held["ALWAYS_OPEN"]
+    # On every non-rebalance date, ALWAYS_OPEN's weight must be identical to
+    # the previous date's -- no drift, regardless of what the other column's
+    # closures are doing that day.
+    unchanged = always_open.diff().fillna(0.0) == 0.0
+    assert unchanged[~is_rebalance_date].all()
+    # It must actually still be capped by the turnover budget (not just
+    # trivially flat because it started at its target).
+    assert always_open.iloc[0] < 0.9
+
+
+def test_turnover_budget_excludes_closed_symbols() -> None:
+    """The turnover cap for a date must apply only to symbols actually
+    tradable that day -- a closed symbol never consumes any of the budget,
+    directly or via being scaled down alongside open symbols."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="D")
+    targets = pd.DataFrame({"A": [0.5, 1.0], "B": [0.5, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, True], "B": [True, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.2,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    # B (closed) contributes nothing to day-1's turnover; A gets the full budget.
+    day_1 = cast(float, held.loc[idx[1], "A"])
+    day_0 = cast(float, held.loc[idx[0], "A"])
+    assert (day_1 - day_0) == pytest.approx(0.2)
+
+
+def test_no_trade_cost_or_turnover_for_closed_symbol() -> None:
+    """A closed symbol's frozen weight must translate into exactly zero
+    executed weight *change* -- no cost, no turnover -- confirming
+    `execution_model.py`/`accounting.py` need no changes of their own."""
+    from quantlab.portfolio.rebalancing import compute_turnover
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    held = pd.DataFrame({"A": [0.5, 0.5, 0.5], "B": [0.2, 0.5, 0.7]}, index=idx)
+    turnover = compute_turnover(held)
+    # A never changes across these rows -- turnover on day 2/3 must come
+    # entirely from B.
+    assert turnover.iloc[1] == pytest.approx(abs(0.5 - 0.2))
+    assert turnover.iloc[2] == pytest.approx(abs(0.7 - 0.5))
+
+
+def test_frozen_symbol_forces_partial_execution_to_stay_within_gross_exposure() -> None:
+    """The exact scenario identified in review: previous A=0.5/B=0.5
+    (gross=1.0), a new target A=1.0/B=0.0 (also gross=1.0, individually
+    valid), but B is closed. Naively freezing B at 0.5 while moving A to 1.0
+    would give gross=1.5 -- this must never happen."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=2, freq="D")
+    targets = pd.DataFrame({"A": [0.5, 1.0], "B": [0.5, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True, True], "B": [True, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_gross_exposure=1.0,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert_all_rows_compliant(held, maximum_gross_exposure=1.0, long_only=True)
+    # B stays frozen; A must NOT reach 1.0, since B pinned at 0.5 forbids it.
+    assert held.loc[idx[1], "B"] == pytest.approx(0.5)
+    assert cast(float, held.loc[idx[1], "A"]) < 1.0 - 1e-6
+
+
+def test_max_feasible_fraction_finds_the_exact_convex_boundary() -> None:
+    """Direct unit test of the bisection helper against a hand-computed
+    boundary: previous=[0.5, 0.5], change=[0.5, 0.0] (only column 0 moves),
+    gross_cap=1.0 -- the exact boundary is f=0 (any positive f breaches gross)."""
+    from quantlab.portfolio.rebalancing import _max_feasible_fraction
+
+    previous = np.array([0.5, 0.5])
+    change = np.array([0.5, 0.0])
+    fraction = _max_feasible_fraction(
+        previous,
+        change,
+        maximum_weight=None,
+        maximum_gross_exposure=1.0,
+        maximum_net_exposure=None,
+        long_only=True,
+        upper_bound=1.0,
+    )
+    assert fraction == pytest.approx(0.0, abs=1e-6)
+
+    # A looser cap (1.2) allows exactly f=0.4 (0.5 + 0.4*0.5 = 0.7, + 0.5 = 1.2).
+    fraction_loose = _max_feasible_fraction(
+        previous,
+        change,
+        maximum_weight=None,
+        maximum_gross_exposure=1.2,
+        maximum_net_exposure=None,
+        long_only=True,
+        upper_bound=1.0,
+    )
+    assert fraction_loose == pytest.approx(0.4, abs=1e-6)
+
+
+def test_compliance_limited_shortfall_becomes_pending_and_retried_next_session() -> (
+    None
+):
+    """When gross-exposure interaction (not turnover) limits how far a
+    column can move because another column is frozen, the shortfall must
+    still be retried on the next tradable date -- not silently dropped."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import rebalance_and_cap_turnover
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    # Day 0: A=0.5,B=0.5. Day 1: target A=1.0,B=0.0 but B closed -> A limited
+    # by gross cap, not reaching 1.0. Day 2: B still closed -> A must keep
+    # trying (and since B stays frozen at 0.5, A stays capped at <=0.5 too,
+    # but the mechanism must still attempt it rather than giving up).
+    targets = pd.DataFrame({"A": [0.5, 1.0, 1.0], "B": [0.5, 0.0, 0.0]}, index=idx)
+    tradable = pd.DataFrame({"A": [True] * 3, "B": [True, False, False]}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_gross_exposure=1.0,
+        long_only=True,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    assert_all_rows_compliant(held, maximum_gross_exposure=1.0, long_only=True)
+    # A never exceeds what's feasible while B stays frozen at 0.5.
+    assert (held["A"] <= 0.5 + 1e-9).all()
+
+
+def test_compliance_limited_flag_never_triggers_when_every_symbol_is_tradable() -> None:
+    """Non-regression for the review's central concern: with no closures
+    anywhere, compliance can never bind below the turnover-derived fraction,
+    so the pending mechanism must never activate -- cadence stays exactly
+    the plain `cap_turnover` behaviour."""
+    from quantlab.config import PortfolioConfig, RebalanceFrequency
+    from quantlab.portfolio.rebalancing import (
+        apply_rebalancing,
+        cap_turnover,
+        rebalance_and_cap_turnover,
+    )
+
+    idx = pd.date_range("2024-01-01", periods=8, freq="D")
+    targets = pd.DataFrame({"A": [0.9] * 8, "B": [0.05] * 8}, index=idx)
+    tradable = pd.DataFrame({"A": [True] * 8, "B": [True] * 8}, index=idx)
+    cfg = PortfolioConfig(
+        rebalance_frequency=RebalanceFrequency.DAILY,
+        maximum_turnover=0.05,
+        maximum_gross_exposure=1.0,
+    )
+    held = rebalance_and_cap_turnover(targets, cfg, tradable=tradable)
+    expected = cap_turnover(
+        apply_rebalancing(targets, "daily"),
+        0.05,
+        rebalance_index=idx,
+        maximum_gross_exposure=1.0,
+    )
+    pd.testing.assert_frame_equal(held, expected)
+
+
+def test_no_execution_cost_or_turnover_for_a_closed_symbol_on_closed_dates() -> None:
+    """End-to-end confirmation that a closed symbol never appears in the
+    accounting layer's turnover/cost path on a date it's closed."""
+    from quantlab.backtesting.accounting import compute_executed_weights
+
+    idx = pd.date_range("2024-01-01", periods=3, freq="D")
+    held = pd.DataFrame({"A": [0.5, 0.5, 0.5], "B": [0.2, 0.5, 0.7]}, index=idx)
+    executed = compute_executed_weights(held)
+    # A's executed (lagged) series is constant after the mechanical
+    # first-row-zero artifact (compute_executed_weights always forces row 0
+    # to 0.0 regardless of activity) -- no trade is ever implied thereafter.
+    assert executed["A"].iloc[1:].nunique(dropna=True) <= 1

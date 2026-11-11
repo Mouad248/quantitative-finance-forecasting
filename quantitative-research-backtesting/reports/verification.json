@@ -1,0 +1,33 @@
+{
+  "original_backup_files_verified": 230,
+  "python_sources_parsed": 176,
+  "known_personal_metadata_files": [],
+  "notebook_cells_with_outputs": 0,
+  "license_attribution_retained": true,
+  "tests": {
+    "focused_pytest_cases_passed": 5,
+    "broad_suite": "Stopped after progress past 71 percent to bound execution time; not a complete passing run",
+    "initial_failures": "Three old global Streamlit API mismatches and missing source-checkout package version",
+    "resolution": "Compatible isolated Streamlit installed; source version fallback fixed; all five focused cases pass",
+    "plugin_autoload_disabled": "Shared Python 3.14 Hypothesis native module is incompatible with Python 3.13"
+  },
+  "lint_changed_files": "passed",
+  "synthetic_demo": {
+    "rows": 4864,
+    "symbols": 4,
+    "periods": 1216,
+    "result_directory": "reports/offline_demo",
+    "full_sample_only": true,
+    "market_performance_evidence": false
+  },
+  "fixes": [
+    "Record QuantLab version when run directly from source"
+  ],
+  "unverified": [
+    "Complete numerical suite",
+    "Full dashboard",
+    "Live market downloads",
+    "Walk-forward demo",
+    "Historical performance claims"
+  ]
+}

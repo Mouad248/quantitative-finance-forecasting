@@ -1,0 +1,83 @@
+# Minimal default configuration. A small Yahoo Finance experiment used as a
+# template and for smoke tests when network data are available.
+experiment_name: default_buy_and_hold
+
+data:
+  instruments:
+    - symbol: SPY
+      source: yahoo
+      calendar: XNYS
+    - symbol: QQQ
+      source: yahoo
+      calendar: XNYS
+  start_date: "2015-01-01"
+  end_date: "2024-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: buy_and_hold
+  parameters: {}
+  # Price series generate_signals() reads -- does not affect execution/
+  # costs (see docs/backtesting.md and config.py's own signal_price_type).
+  signal_price_type: adjusted_close
+
+portfolio:
+  allocator: equal_weight
+  maximum_weight: 1.0
+  rebalance_frequency: monthly
+
+execution:
+  commission_bps: 1.0
+  spread_bps: 1.0
+  slippage_bps: 1.0
+  slippage_model: constant
+  # same_bar_close (default, backtest-only idealization) | next_bar_open
+  # (only daily frequency is validated) | immediate_after_close (24/7
+  # markets only, validated) -- see docs/backtesting.md#execution-timing.
+  # Explicit here so a future default change never silently alters this
+  # published experiment's own numbers.
+  execution_timing: same_bar_close
+
+backtest:
+  initial_capital: 100000
+  # symbol | equal_weight | first_asset | cash
+  benchmark_kind: symbol
+  # Used only by the symbol benchmark. Matches the SPY instrument above
+  # exactly (same source/calendar), so its already-loaded data is reused.
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
+  risk_free_rate: 0.0
+  periods_per_year: 252
+
+validation:
+  method: holdout
+  validation_ratio: 0.2
+  test_ratio: 0.2
+
+reproducibility:
+  random_seed: 42
+
+# `quantlab stress-test|bootstrap|permutation-test --config
+# configs/default.yaml` each run regardless of `enabled` below (only the
+# `robustness` orchestrator reads it). No `sensitivity` block: buy_and_hold
+# has no strategy parameters to sweep.
+robustness:
+  stress_test:
+    enabled: true
+  bootstrap:
+    enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
+  permutation_test:
+    enabled: true
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/default_buy_and_hold
+  save_html_report: true
+  save_figures: true

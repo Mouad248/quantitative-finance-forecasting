@@ -1,0 +1,96 @@
+{
+  "scope": "Fresh CSV-based baseline; not archived neural forecasts or paper reproduction",
+  "datasets": [
+    {
+      "file": "DE_market__2015-01-01__2020-12-31.csv",
+      "rows": 52608,
+      "target_columns": [
+        "TARG__DE_price"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2020-12-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_CNOR_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_CNOR"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_CSUD_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_CSUD"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_NORD_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_NORD"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_SARD_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_SARD"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_SICI_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_SICI"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    },
+    {
+      "file": "MGP_SUD_market__2015-01-01__2019-08-31.csv",
+      "rows": 40896,
+      "target_columns": [
+        "TARG__MGP_SUD"
+      ],
+      "first_date": "2015-01-01",
+      "last_date": "2019-08-31",
+      "nonfinite_targets": 0
+    }
+  ],
+  "baseline": {
+    "market": "DE_price",
+    "forecast": "previous day's same-hour observed price",
+    "calibration_days": 182,
+    "test_days": 60,
+    "calibration_start": "2020-05-04",
+    "calibration_end": "2020-11-01",
+    "test_start": "2020-11-02",
+    "test_end": "2020-12-31",
+    "nominal_coverage": 0.8,
+    "test_observations": 1440,
+    "mae": 11.692798611111112,
+    "empirical_interval_coverage": 0.7097222222222223,
+    "mean_interval_width": 27.7325,
+    "mean_winkler_score": 67.32284722222222,
+    "kupiec_LR": 66.68290011101544,
+    "kupiec_p_value": 3.188893590762768e-16,
+    "caveat": "Time-dependent observations: this baseline does not establish exchangeability or independent-hit test assumptions."
+  },
+  "archived_pickle_files_loaded": 0,
+  "neural_models_trained": 0
+}

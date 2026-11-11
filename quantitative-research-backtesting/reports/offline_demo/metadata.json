@@ -1,0 +1,82 @@
+{
+  "run_timestamp": "2026-11-10T04:42:27.058214+00:00",
+  "experiment_name": "demo_offline_momentum",
+  "strategy": "cross_sectional_momentum",
+  "strategy_parameters": {
+    "lookback_period": 189,
+    "skip_period": 21,
+    "top_fraction": 0.5,
+    "bottom_fraction": 0.5,
+    "long_short": false,
+    "signal_scaling": "binary",
+    "price_type": "adjusted_close",
+    "stop_loss_pct": null,
+    "take_profit_pct": null
+  },
+  "config_yaml_reflects_strategy": true,
+  "allocator": "inverse_volatility",
+  "allocator_parameters": {
+    "volatility_window": 63,
+    "maximum_weight": 0.6,
+    "periods_per_year": 252
+  },
+  "config_yaml_reflects_allocator": true,
+  "config_yaml_reflects_execution": true,
+  "execution_price_source_fingerprint": "default (RatioApproximatedExecutionPrices)",
+  "commission_class": "quantlab.execution.costs.CommissionModel",
+  "commission_bps": 2.0,
+  "spread_class": "quantlab.execution.costs.SpreadModel",
+  "spread_bps": 3.0,
+  "slippage_class": "quantlab.execution.slippage.ConstantSlippageModel",
+  "slippage_model": "constant",
+  "slippage_bps": 2.0,
+  "symbols": [
+    "SPY",
+    "QQQ",
+    "TLT",
+    "GLD"
+  ],
+  "start_date": "2019-01-01",
+  "end_date": "2023-10-30",
+  "random_seed": 42,
+  "n_rows": 4864,
+  "elapsed_seconds": 10.5401,
+  "periods_per_year": 252,
+  "data_hash": "983dde29754b548d5ea0b2a841665b18216a5e8d77c5cb93f758a261f673c7a8",
+  "git_commit": null,
+  "git_dirty": null,
+  "dependency_versions": {
+    "quantlab": "0.1.0",
+    "pandas": "3.1.1",
+    "numpy": "2.5.4",
+    "pydantic": "2.14.3",
+    "scipy": "1.18.1",
+    "statsmodels": "0.15.0",
+    "pandas-market-calendars": "5.6.0"
+  },
+  "code_hash": "f6773f106a198389a3cb18c1d6c5f06af5b2605aea36230e1ab1454e576c0a9f",
+  "generator_hash": "face4c8f826a02f214ac217deb8643786f0d4f2827cfebf789b1c4126f267f62",
+  "data_quality": {
+    "row_count": 4864,
+    "raw_row_count": 4864,
+    "clean_row_count": 4864,
+    "removed_row_count": 0,
+    "duplicate_count": 0,
+    "missing_value_count": {},
+    "invalid_price_count": 0,
+    "missing_periods_count": 0,
+    "missing_periods": [],
+    "warnings": [],
+    "is_clean": true,
+    "closure_discarded_count": 0,
+    "closure_inserted_count": 0,
+    "bundled_demo_data_used": false
+  },
+  "walk_forward_csv_checksums": {},
+  "result_scope": "full_sample",
+  "save_warnings": [],
+  "trade_log_schema_version": 2,
+  "resolved_config": {
+    "signal_price_type": "adjusted_close"
+  }
+}

@@ -1,0 +1,46 @@
+{
+  "data_kind": "seeded synthetic prices; not market performance",
+  "seed": 42,
+  "price_rows": 504,
+  "assets": 4,
+  "minimum_volatility_weights": {
+    "A": 0.5030015955274687,
+    "B": 0.28151807262382933,
+    "C": 0.15471421182102157,
+    "D": 0.060766120027680545
+  },
+  "risk_parity_weights": {
+    "A": 0.36969032588307565,
+    "B": 0.2783530318984651,
+    "C": 0.19741699807521526,
+    "D": 0.15453964414324398
+  },
+  "risk_parity_contributions": {
+    "A": 0.2500000467043122,
+    "B": 0.2499999487619349,
+    "C": 0.24999992685874695,
+    "D": 0.25000007767500587
+  },
+  "cvar_weights": {
+    "A": 0.4470429329573508,
+    "B": 0.4642172358409139,
+    "C": 0.0881039388709822,
+    "D": 0.0006358923307530677
+  },
+  "training_cvar": 0.011549865166061612,
+  "backtest": {
+    "evaluation_days": 377,
+    "rebalance_dates": [
+      "2020-06-30",
+      "2020-09-30",
+      "2020-12-31",
+      "2021-03-31",
+      "2021-06-30",
+      "2021-09-30",
+      "2021-12-06"
+    ],
+    "total_net_return": -0.10585874536831286,
+    "sum_cost_fractions": 0.0012891364081653166,
+    "assumption": "observe current close, trade at that close, new weights earn next day return"
+  }
+}

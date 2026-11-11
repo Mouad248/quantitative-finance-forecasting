@@ -1,0 +1,151 @@
+# Example experiment:
+# Robust Cross-Sectional Momentum Across Liquid Multi-Asset ETFs.
+experiment_name: cross_sectional_momentum_etfs
+
+# Overrides the auto-generated report text (see quantlab.reporting.
+# research_summary) with this experiment's own wording. Both are optional --
+# omit either to fall back to the auto-generated version.
+research_question: >-
+  Can cross-sectional momentum generate stable out-of-sample risk-adjusted
+  returns across liquid ETFs after transaction costs and volatility
+  targeting?
+hypothesis: >-
+  H1: net of modelled transaction costs, long-only cross-sectional momentum
+  across this ETF universe has a genuine positive risk-adjusted edge. H0: any
+  apparent edge is indistinguishable from noise or is eliminated by trading
+  costs and volatility targeting.
+
+data:
+  instruments:
+    - symbol: SPY   # US large cap
+      source: yahoo
+      calendar: XNYS
+    - symbol: QQQ   # US tech / Nasdaq 100
+      source: yahoo
+      calendar: XNYS
+    - symbol: IWM   # US small cap
+      source: yahoo
+      calendar: XNYS
+    - symbol: EFA   # Developed ex-US
+      source: yahoo
+      calendar: XNYS
+    - symbol: EEM   # Emerging markets
+      source: yahoo
+      calendar: XNYS
+    - symbol: TLT   # Long US treasuries
+      source: yahoo
+      calendar: XNYS
+    - symbol: GLD   # Gold
+      source: yahoo
+      calendar: XNYS
+    - symbol: VNQ   # US real estate
+      source: yahoo
+      calendar: XNYS
+  start_date: "2008-01-01"
+  end_date: "2025-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: cross_sectional_momentum
+  parameters:
+    lookback_period: 252     # ~12 months
+    skip_period: 21          # exclude the most recent month
+    top_fraction: 0.25
+    bottom_fraction: 0.25
+    long_short: false        # long-only for the main version
+    signal_scaling: binary
+  # Price series generate_signals() reads -- does not affect execution/
+  # costs (see docs/backtesting.md and config.py's own signal_price_type).
+  # Default is "adjusted_close" (recommended for equities/ETFs, avoids
+  # false signals from splits/dividends) -- shown explicitly here for
+  # illustration.
+  signal_price_type: adjusted_close
+
+portfolio:
+  allocator: inverse_volatility
+  maximum_weight: 0.30
+  maximum_gross_exposure: 1.0
+  maximum_net_exposure: 1.0
+  target_volatility: 0.12
+  volatility_window: 63
+  maximum_leverage: 1.5
+  rebalance_frequency: monthly
+
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+  # Explicit so a future default change never silently alters this
+  # published experiment's own numbers (see
+  # docs/backtesting.md#execution-timing for the three possible values).
+  execution_timing: same_bar_close
+
+backtest:
+  initial_capital: 100000
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
+  risk_free_rate: 0.02
+  periods_per_year: 252
+
+validation:
+  method: walk_forward
+  train_window: 1000
+  validation_window: 252
+  test_window: 126
+  # Advance between consecutive folds' train windows. Omit (or set equal to
+  # test_window) for the default: contiguous, non-overlapping test blocks.
+  # A smaller step overlaps test blocks for denser evaluation at higher
+  # compute cost. step must not exceed test_window -- a larger value is
+  # rejected outright (it would skip dates between folds' test blocks
+  # entirely), not silently allowed to skip periods.
+  step: 126
+  expanding: true
+  optimization_metric: sharpe
+  # Freeze the published search space: tune timing while keeping the 25%
+  # selection breadth fixed as part of this experiment's hypothesis.
+  parameter_grid:
+    lookback_period: [126, 189, 252]
+    skip_period: [0, 21]
+
+reproducibility:
+  random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+    # Each list is a set of magnitudes evaluated independently (one
+    # scenario row per value); an empty list disables that scenario type
+    # entirely. Values shown here match this project's own defaults.
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
+    reduce_universe_by: [1]
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+    block_size: 5
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
+  permutation_test:
+    enabled: true
+    n_iterations: 1000
+  sensitivity:
+    enabled: true
+    # Signal timing vs selection breadth — distinct from the walk-forward
+    # grid above (lookback_period/skip_period), not a repeat of it.
+    parameters:
+      lookback_period: [126, 189, 252]
+      top_fraction: [0.10, 0.25, 0.50]
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/cross_sectional_momentum_etfs
+  save_html_report: true
+  save_figures: true

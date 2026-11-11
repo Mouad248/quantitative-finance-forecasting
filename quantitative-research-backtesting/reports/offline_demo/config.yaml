@@ -1,0 +1,116 @@
+experiment_name: demo_offline_momentum
+data:
+  instruments:
+  - symbol: SPY
+    source: csv
+    calendar: XNYS
+  - symbol: QQQ
+    source: csv
+    calendar: XNYS
+  - symbol: TLT
+    source: csv
+    calendar: XNYS
+  - symbol: GLD
+    source: csv
+    calendar: XNYS
+  start_date: '2019-01-01'
+  end_date: '2023-10-30'
+  frequency: 1d
+  missing_value_policy: drop
+  forward_fill_limit: 1
+  use_bundled_demo_data: true
+strategy:
+  name: cross_sectional_momentum
+  parameters:
+    lookback_period: 189
+    skip_period: 21
+    top_fraction: 0.5
+    bottom_fraction: 0.5
+    long_short: false
+    signal_scaling: binary
+  signal_price_type: adjusted_close
+portfolio:
+  allocator: inverse_volatility
+  maximum_weight: 0.6
+  target_minimum_weight: null
+  maximum_gross_exposure: 1.0
+  maximum_net_exposure: null
+  target_maximum_positions: null
+  long_only: false
+  target_volatility: 0.12
+  volatility_window: 63
+  maximum_leverage: 1.5
+  rebalance_frequency: monthly
+  maximum_turnover: null
+  model_weight_drift: true
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+  impact_coefficient: 0.1
+  execution_timing: same_bar_close
+backtest:
+  initial_capital: 100000.0
+  benchmark_kind: symbol
+  benchmark:
+    symbol: SPY
+    source: csv
+    calendar: XNYS
+  risk_free_rate: 0.02
+  periods_per_year: 252
+validation:
+  method: walk_forward
+  validation_ratio: null
+  test_ratio: null
+  train_window: 500
+  validation_window: 126
+  test_window: 126
+  step: 126
+  expanding: true
+  optimization_metric: sharpe
+  parameter_grid: null
+reproducibility:
+  random_seed: 42
+robustness:
+  stress_test:
+    enabled: true
+    commission_multipliers:
+    - 2.0
+    - 5.0
+    slippage_multipliers:
+    - 2.0
+    execution_delays:
+    - 1
+    best_days_removed:
+    - 10
+    reduce_universe_by:
+    - 1
+  bootstrap:
+    enabled: true
+    n_iterations: 1000
+    block_size: 1
+    confidence_level: 0.9
+  permutation_test:
+    enabled: true
+    n_iterations: 1000
+  sensitivity:
+    enabled: true
+    parameters:
+      lookback_period:
+      - 126
+      - 189
+      - 252
+      top_fraction:
+      - 0.25
+      - 0.5
+output:
+  directory: null
+  save_html_report: true
+  save_figures: true
+research_question: Does cross-sectional momentum on this small offline demo universe
+  produce a stable out-of-sample signal, purely as a fast, no-network illustration
+  of the walk-forward pipeline?
+hypothesis: 'H1: the walk-forward pipeline selects a consistent momentum parameter
+  across folds on this synthetic demo data. H0: fold-to-fold selection is effectively
+  random. (Demo data is synthetic -- not evidence about real markets either way.)'

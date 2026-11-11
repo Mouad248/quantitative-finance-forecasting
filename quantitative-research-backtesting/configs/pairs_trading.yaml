@@ -1,0 +1,111 @@
+# Example experiment: pairs trading on two economically-related ETFs.
+# EWA (Australia) / EWC (Canada) are two commodity-linked developed markets — a
+# classic, economically-motivated pair (not chosen for historical performance).
+experiment_name: pairs_trading_ewa_ewc
+
+research_question: >-
+  Does the EWA/EWC spread mean-revert predictably enough to generate a
+  positive risk-adjusted edge after transaction costs?
+hypothesis: >-
+  H1: net of modelled transaction costs, a dynamically hedged EWA/EWC
+  pairs-trading signal has a genuine positive risk-adjusted edge. H0: any
+  apparent edge is indistinguishable from noise or is eliminated by
+  trading costs.
+
+data:
+  instruments:
+    - symbol: EWA
+      source: yahoo
+      calendar: XNYS
+    - symbol: EWC
+      source: yahoo
+      calendar: XNYS
+  start_date: "2010-01-01"
+  end_date: "2025-12-31"
+  frequency: "1d"
+  missing_value_policy: "drop"
+
+strategy:
+  name: pairs_trading
+  parameters:
+    symbol_a: EWA
+    symbol_b: EWC
+    formation_window: 252
+    indicator_window: 63
+    indicator: zscore
+    entry_threshold: 2.0
+    exit_threshold: 0.5
+    stop_threshold: 4.0
+    dynamic_hedge_ratio: true
+    adf_pvalue_threshold: 0.10
+  # Price series generate_signals() reads -- does not affect execution/
+  # costs (see docs/backtesting.md and config.py's own signal_price_type).
+  signal_price_type: adjusted_close
+
+portfolio:
+  allocator: signal_proportional
+  maximum_gross_exposure: 2.0
+  maximum_net_exposure: 1.0
+  rebalance_frequency: daily
+
+execution:
+  commission_bps: 2.0
+  spread_bps: 3.0
+  slippage_bps: 2.0
+  slippage_model: constant
+  # Explicit so a future default change never silently alters this
+  # published experiment's own numbers (see
+  # docs/backtesting.md#execution-timing for the three possible values).
+  execution_timing: same_bar_close
+
+backtest:
+  initial_capital: 100000
+  # SPY is external here (not a tradable instrument above).
+  benchmark:
+    symbol: SPY
+    source: yahoo
+    calendar: XNYS
+  risk_free_rate: 0.02
+  periods_per_year: 252
+
+validation:
+  method: holdout
+  validation_ratio: 0.2
+  test_ratio: 0.2
+
+reproducibility:
+  random_seed: 42
+
+robustness:
+  stress_test:
+    enabled: true
+    # Each list is a set of magnitudes evaluated independently (one
+    # scenario row per value); an empty list disables that scenario type
+    # entirely.
+    commission_multipliers: [2.0, 5.0]
+    slippage_multipliers: [2.0]
+    execution_delays: [1]
+    best_days_removed: [10]
+    # Disabled: this pair is exactly 2 symbols, so removing either one
+    # doesn't leave a smaller version of the same strategy -- it breaks the
+    # pair. Empty means "this scenario type does not apply here", not zero.
+    reduce_universe_by: []
+  bootstrap:
+    enabled: true
+    # Width of the reported p_lower/p_upper percentile band (0.90 -> the
+    # 5th/95th percentiles).
+    confidence_level: 0.90
+  permutation_test:
+    enabled: true
+  sensitivity:
+    enabled: true
+    parameters:
+      formation_window: [126, 252, 504]
+      indicator_window: [21, 63, 126]
+
+# Where and what a run saves. Omit entirely for the default: reports/
+# generated/<experiment_name>/, both artefact toggles enabled.
+output:
+  # directory: reports/generated/pairs_trading_ewa_ewc
+  save_html_report: true
+  save_figures: true

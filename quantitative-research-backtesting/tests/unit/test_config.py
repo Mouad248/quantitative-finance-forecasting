@@ -1,0 +1,1089 @@
+"""Tests for experiment configuration loading and validation."""
+
+from __future__ import annotations
+
+from collections.abc import Callable
+from datetime import date
+from pathlib import Path
+from typing import Any, cast
+
+import numpy as np
+import pytest
+
+from quantlab.config import (
+    BacktestConfig,
+    BenchmarkKind,
+    DataFrequency,
+    ExecutionConfig,
+    ExecutionTiming,
+    ExperimentConfig,
+    MissingValuePolicy,
+    PortfolioConfig,
+    ReproducibilityConfig,
+    ValidationConfig,
+    compatible_execution_timings,
+)
+from quantlab.constants import CONFIGS_DIR
+from quantlab.exceptions import InvalidConfigurationError
+
+ALL_CONFIGS = sorted(CONFIGS_DIR.glob("*.yaml"))
+
+
+def test_shipped_configs_exist() -> None:
+    assert ALL_CONFIGS, "expected at least one shipped YAML configuration"
+
+
+@pytest.mark.parametrize("path", ALL_CONFIGS, ids=lambda p: p.name)
+def test_shipped_configs_load(path: Path) -> None:
+    """Every YAML shipped in configs/ must validate."""
+    cfg = ExperimentConfig.from_yaml(path)
+    assert cfg.experiment_name
+    assert cfg.symbols
+    assert cfg.periods_per_year > 0
+
+
+def test_walk_forward_parameter_grid_is_validated_at_config_load() -> None:
+    base: dict[str, Any] = {
+        "experiment_name": "yaml_grid",
+        "data": {
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+            "start_date": "2020-01-01",
+            "end_date": "2022-01-01",
+        },
+        "strategy": {
+            "name": "mean_reversion",
+            "parameters": {"lookback_period": 20},
+        },
+        "validation": {
+            "method": "walk_forward",
+            "parameter_grid": {"lookback_period": [10, 40]},
+        },
+    }
+
+    config = ExperimentConfig.from_dict(base)
+    assert config.validation.parameter_grid == {"lookback_period": [10, 40]}
+
+    invalid = {
+        **base,
+        "validation": {
+            **base["validation"],
+            "parameter_grid": {"lookback_period": [0]},
+        },
+    }
+    with pytest.raises(InvalidConfigurationError, match="lookback_period"):
+        ExperimentConfig.from_dict(invalid)
+
+
+def test_walk_forward_parameter_grid_rejects_duplicate_candidates_at_load() -> None:
+    """Regression test: `validation.parameter_grid.lookback_period: [126,
+    126]` used to load fine and only fail later, deep inside
+    `walk_forward.py`'s own execution-time duplicate check (`Grid
+    parameter 'lookback_period' must not contain duplicate values`) --
+    caught here at YAML load time instead, mirroring
+    `StressTestSettings`'s own established convention."""
+    base: dict[str, Any] = {
+        "experiment_name": "yaml_grid_dupe",
+        "data": {
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+            "start_date": "2020-01-01",
+            "end_date": "2022-01-01",
+        },
+        "strategy": {
+            "name": "mean_reversion",
+            "parameters": {"lookback_period": 20},
+        },
+        "validation": {
+            "method": "walk_forward",
+            "parameter_grid": {"lookback_period": [126, 126]},
+        },
+    }
+    with pytest.raises(InvalidConfigurationError, match="duplicate"):
+        ExperimentConfig.from_dict(base)
+
+
+def test_parameter_grid_is_rejected_for_non_walk_forward_validation() -> None:
+    with pytest.raises(ValueError, match="applies only"):
+        ValidationConfig.model_validate(
+            {"method": "holdout", "parameter_grid": {"lookback_period": [20]}}
+        )
+
+
+def _robustness_base_dict(**robustness_overrides: Any) -> dict[str, Any]:
+    return {
+        "experiment_name": "robustness_cfg",
+        "data": {
+            "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+            "start_date": "2020-01-01",
+            "end_date": "2022-01-01",
+        },
+        "strategy": {
+            "name": "mean_reversion",
+            "parameters": {"lookback_period": 20},
+        },
+        "robustness": robustness_overrides,
+    }
+
+
+def test_robustness_config_defaults_to_everything_disabled() -> None:
+    config = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "no_robustness_block",
+            "data": {
+                "instruments": [{"symbol": "AAA", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2020-01-01",
+                "end_date": "2022-01-01",
+            },
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 20},
+            },
+        }
+    )
+    assert config.robustness.stress_test.enabled is False
+    assert config.robustness.bootstrap.enabled is False
+    assert config.robustness.bootstrap.n_iterations == 1000
+    assert config.robustness.bootstrap.block_size == 1
+    assert config.robustness.permutation_test.enabled is False
+    assert config.robustness.permutation_test.n_iterations == 1000
+    assert config.robustness.sensitivity.enabled is False
+    assert config.robustness.sensitivity.parameters is None
+
+
+def test_robustness_bootstrap_settings_accept_overrides() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            bootstrap={"enabled": True, "n_iterations": 500, "block_size": 5}
+        )
+    )
+    assert config.robustness.bootstrap.enabled is True
+    assert config.robustness.bootstrap.n_iterations == 500
+    assert config.robustness.bootstrap.block_size == 5
+
+
+@pytest.mark.parametrize("bad_n_iterations", [0, -1])
+def test_robustness_bootstrap_n_iterations_must_be_positive(
+    bad_n_iterations: int,
+) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(bootstrap={"n_iterations": bad_n_iterations})
+        )
+
+
+def test_validation_step_defaults_to_none_and_accepts_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.validation.step is None
+    with_step = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "validation": {"method": "walk_forward", "step": 5},
+        }
+    )
+    assert with_step.validation.step == 5
+
+
+def test_validation_walk_forward_fields_rejected_outside_walk_forward_method() -> None:
+    with pytest.raises(InvalidConfigurationError, match="walk_forward"):
+        ExperimentConfig.from_dict(
+            {**_robustness_base_dict(), "validation": {"step": 5}}
+        )
+
+
+@pytest.mark.parametrize("bad_step", [0, -1])
+def test_validation_step_must_be_positive(bad_step: int) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {**_robustness_base_dict(), "validation": {"step": bad_step}}
+        )
+
+
+def test_validation_step_exceeding_test_window_is_rejected() -> None:
+    """A larger step than test_window would skip dates between consecutive
+    folds' test blocks entirely -- documented as forbidden (see
+    ValidationConfig.step's own docstring) but previously unenforced at
+    config-load time, only failing much later inside the walk-forward
+    validator itself."""
+    with pytest.raises(InvalidConfigurationError, match="step"):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "validation": {
+                    "method": "walk_forward",
+                    "test_window": 10,
+                    "step": 11,
+                },
+            }
+        )
+
+
+def test_validation_step_equal_to_test_window_is_accepted() -> None:
+    config = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "validation": {"method": "walk_forward", "test_window": 10, "step": 10},
+        }
+    )
+    assert config.validation.step == 10
+
+
+def test_validation_step_exceeding_default_test_window_is_rejected() -> None:
+    """test_window omitted -> resolve_walk_forward_windows()'s own 126
+    default applies; the same check must account for it, not only an
+    explicitly-set test_window."""
+    with pytest.raises(InvalidConfigurationError, match="step"):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "validation": {"method": "walk_forward", "step": 200},
+            }
+        )
+
+
+def test_bootstrap_confidence_level_default_and_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.robustness.bootstrap.confidence_level == pytest.approx(0.90)
+    custom = ExperimentConfig.from_dict(
+        _robustness_base_dict(bootstrap={"confidence_level": 0.95})
+    )
+    assert custom.robustness.bootstrap.confidence_level == pytest.approx(0.95)
+
+
+@pytest.mark.parametrize("bad_level", [0.0, 1.0, -0.1, 1.5])
+def test_bootstrap_confidence_level_must_be_strictly_between_0_and_1(
+    bad_level: float,
+) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(bootstrap={"confidence_level": bad_level})
+        )
+
+
+def test_stress_test_settings_default_lists_reproduce_original_scenarios() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    settings = config.robustness.stress_test
+    assert settings.commission_multipliers == [2.0, 5.0]
+    assert settings.slippage_multipliers == [2.0]
+    assert settings.execution_delays == [1]
+    assert settings.best_days_removed == [10]
+    assert settings.reduce_universe_by == [1]
+
+
+def test_stress_test_settings_accept_custom_lists() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            stress_test={
+                "commission_multipliers": [3.0],
+                "slippage_multipliers": [],
+                "execution_delays": [1, 2, 3],
+                "best_days_removed": [5, 20],
+                "reduce_universe_by": [],
+            }
+        )
+    )
+    settings = config.robustness.stress_test
+    assert settings.commission_multipliers == [3.0]
+    assert settings.slippage_multipliers == []
+    assert settings.execution_delays == [1, 2, 3]
+    assert settings.best_days_removed == [5, 20]
+    assert settings.reduce_universe_by == []
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "commission_multipliers",
+        "slippage_multipliers",
+        "execution_delays",
+        "best_days_removed",
+        "reduce_universe_by",
+    ],
+)
+def test_stress_test_settings_reject_duplicate_values(field: str) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(_robustness_base_dict(stress_test={field: [2, 2]}))
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "commission_multipliers",
+        "slippage_multipliers",
+        "execution_delays",
+        "best_days_removed",
+        "reduce_universe_by",
+    ],
+)
+def test_stress_test_settings_reject_non_positive_values(field: str) -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(_robustness_base_dict(stress_test={field: [0]}))
+
+
+def test_strategy_signal_price_type_default_and_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.strategy.signal_price_type == "adjusted_close"
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "strategy": {
+                "name": "mean_reversion",
+                "parameters": {"lookback_period": 20},
+                "signal_price_type": "close",
+            },
+        }
+    )
+    assert custom.strategy.signal_price_type == "close"
+
+
+def test_strategy_signal_price_type_rejects_invalid_value() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                **_robustness_base_dict(),
+                "strategy": {
+                    "name": "mean_reversion",
+                    "parameters": {"lookback_period": 20},
+                    "signal_price_type": "vwap",
+                },
+            }
+        )
+
+
+def test_research_question_and_hypothesis_default_none_and_accept_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.research_question is None
+    assert config.hypothesis is None
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "research_question": "Is this strategy any good?",
+            "hypothesis": "H1: yes. H0: no.",
+        }
+    )
+    assert custom.research_question == "Is this strategy any good?"
+    assert custom.hypothesis == "H1: yes. H0: no."
+
+
+def test_output_config_defaults_and_accepts_override() -> None:
+    config = ExperimentConfig.from_dict(_robustness_base_dict())
+    assert config.output.directory is None
+    assert config.output.save_html_report is True
+    assert config.output.save_figures is True
+    custom = ExperimentConfig.from_dict(
+        {
+            **_robustness_base_dict(),
+            "output": {
+                "directory": "/tmp/custom",
+                "save_html_report": False,
+                "save_figures": False,
+            },
+        }
+    )
+    assert custom.output.directory == "/tmp/custom"
+    assert custom.output.save_html_report is False
+    assert custom.output.save_figures is False
+
+
+@pytest.mark.parametrize(
+    "parameters",
+    [
+        {"lookback_period": [10, 20]},
+        {
+            "lookback_period": [10, 20],
+            "entry_threshold": [1.0, 2.0],
+            "exit_threshold": [0.5],
+        },
+    ],
+)
+def test_robustness_sensitivity_parameters_must_have_exactly_two_keys(
+    parameters: dict[str, list[Any]],
+) -> None:
+    with pytest.raises(InvalidConfigurationError, match="exactly 2"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(sensitivity={"parameters": parameters})
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_empty_candidate_list() -> None:
+    with pytest.raises(InvalidConfigurationError, match="at least one candidate"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {"lookback_period": [10, 20], "entry_threshold": []}
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_duplicate_candidates_at_load() -> (
+    None
+):
+    """Regression test: `robustness.sensitivity.parameters.lookback_
+    period: [126, 126]` used to load fine and only fail later, deep
+    inside `parameter_sensitivity.py`'s own execution-time duplicate
+    check (`Values for 'lookback_period' must not contain duplicates`) --
+    caught here at YAML load time instead, mirroring `StressTestSettings`/
+    `validation.parameter_grid`'s own established convention."""
+    with pytest.raises(InvalidConfigurationError, match="duplicate"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [126, 126],
+                        "entry_threshold": [1.0, 2.0],
+                    }
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_names_validated_against_strategy() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Unknown"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [10, 20],
+                        "not_a_real_parameter": [1, 2],
+                    }
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_boolean_parameter() -> None:
+    """long_only is a structural switch (default value True/False) — sweeping
+    it changes which other parameters are even meaningful, so sensitivity
+    must reject it the same way it rejects an unknown parameter name."""
+    with pytest.raises(InvalidConfigurationError, match="Unknown or unsweepable"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "parameters": {
+                        "lookback_period": [10, 20],
+                        "long_only": [True, False],
+                    }
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_accepts_two_valid_keys() -> None:
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(
+            sensitivity={
+                "enabled": True,
+                "parameters": {
+                    "lookback_period": [10, 20],
+                    "entry_threshold": [1.0, 2.0],
+                },
+            }
+        )
+    )
+    assert config.robustness.sensitivity.enabled is True
+    assert config.robustness.sensitivity.parameters == {
+        "lookback_period": [10, 20],
+        "entry_threshold": [1.0, 2.0],
+    }
+
+
+def test_robustness_sensitivity_enabled_requires_parameters() -> None:
+    """Unlike validation.parameter_grid, sensitivity has no meaningful
+    default -- enabling it without naming the x/y axes must fail at config
+    load, not silently run nothing (or fail later, confusingly, only once
+    the sweep itself is attempted)."""
+    with pytest.raises(InvalidConfigurationError, match="parameters is not set"):
+        ExperimentConfig.from_dict(_robustness_base_dict(sensitivity={"enabled": True}))
+
+
+def test_robustness_sensitivity_disabled_still_allows_missing_parameters() -> None:
+    """The requirement above is specifically about `enabled` -- a disabled
+    (default) sensitivity block must still accept `parameters: None`."""
+    config = ExperimentConfig.from_dict(
+        _robustness_base_dict(sensitivity={"enabled": False})
+    )
+    assert config.robustness.sensitivity.parameters is None
+
+
+def test_robustness_sensitivity_parameters_rejects_an_invalid_candidate_value() -> None:
+    """A known, sweepable parameter name doesn't mean every candidate value
+    is valid for this strategy -- mean_reversion's lookback_period must be
+    >= 1, so `[0]` must be rejected at config load the same way
+    validation.parameter_grid already rejects an invalid grid value,
+    rather than only failing once the sensitivity sweep actually runs."""
+    with pytest.raises(InvalidConfigurationError, match="lookback_period"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "enabled": True,
+                    "parameters": {
+                        "lookback_period": [0],
+                        "entry_threshold": [1.0, 2.0],
+                    },
+                }
+            )
+        )
+
+
+def test_robustness_sensitivity_parameters_rejects_an_invalid_value_combination() -> (
+    None
+):
+    """Each individual value can be independently valid while the
+    *combination* across the two axes still isn't -- this must be checked
+    against the strategy's own combined-parameter validator, not just each
+    axis's values in isolation."""
+    with pytest.raises(InvalidConfigurationError, match="entry_threshold"):
+        ExperimentConfig.from_dict(
+            _robustness_base_dict(
+                sensitivity={
+                    "enabled": True,
+                    "parameters": {
+                        # mean_reversion requires exit_threshold < entry_threshold.
+                        "entry_threshold": [1.0],
+                        "exit_threshold": [2.0],
+                    },
+                }
+            )
+        )
+
+
+def test_flat_accessors(sample_config: ExperimentConfig) -> None:
+    """The flat view must mirror the nested config."""
+    assert sample_config.data_source == "csv"
+    assert sample_config.symbols == ["AAA", "BBB", "CCC"]
+    assert sample_config.commission_bps == 2.0
+    assert sample_config.spread_bps == 3.0
+    assert sample_config.benchmark_symbol == "AAA"
+    assert sample_config.benchmark_kind is BenchmarkKind.SYMBOL
+    assert sample_config.benchmark_label == "AAA"
+    assert sample_config.random_seed == 42
+    assert sample_config.start_date == date(2020, 1, 1)
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected_label"),
+    [
+        ("equal_weight", "Equal weight"),
+        ("first_asset", "AAA"),
+        ("cash", "Cash"),
+    ],
+)
+def test_alternative_benchmark_kinds(kind: str, expected_label: str) -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "benchmark_kind",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAA", "source": "csv", "calendar": "XNYS"},
+                    {"symbol": "BBB", "source": "csv", "calendar": "XNYS"},
+                ],
+                "start_date": "2024-01-01",
+                "end_date": "2024-02-01",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {"benchmark_kind": kind},
+        }
+    )
+
+    assert str(cfg.benchmark_kind) == kind
+    assert cfg.benchmark_label == expected_label
+
+
+def test_non_symbol_benchmark_rejects_benchmark_symbol() -> None:
+    with pytest.raises(InvalidConfigurationError, match="benchmark is only valid"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "benchmark_kind",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAA", "source": "csv", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2024-01-01",
+                    "end_date": "2024-02-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "backtest": {
+                    "benchmark_kind": "cash",
+                    "benchmark": {
+                        "symbol": "SPY",
+                        "source": "csv",
+                        "calendar": "XNYS",
+                    },
+                },
+            }
+        )
+
+
+def test_symbols_are_normalised() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": " spy ", "source": "yahoo", "calendar": "XNYS"},
+                    {"symbol": "QQQ", "source": "yahoo", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    # Stripped and uppercased.
+    assert cfg.symbols == ["SPY", "QQQ"]
+
+
+def test_duplicate_symbol_across_instruments_is_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Duplicate symbol"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"},
+                        {"symbol": "spy", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_missing_value_policy_enum() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "missing_value_policy": "forward_fill",
+                "forward_fill_limit": 2,
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    assert cfg.data.missing_value_policy is MissingValuePolicy.FORWARD_FILL
+    assert cfg.data.forward_fill_limit == 2
+
+
+@pytest.mark.parametrize("value", [0, -1, True])
+def test_invalid_forward_fill_limit_is_rejected(value: object) -> None:
+    with pytest.raises(InvalidConfigurationError, match="forward_fill_limit"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "missing_value_policy": "forward_fill",
+                    "forward_fill_limit": value,
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_non_default_forward_fill_limit_requires_forward_fill_policy() -> None:
+    with pytest.raises(InvalidConfigurationError, match="forward_fill_limit"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "missing_value_policy": "drop",
+                    "forward_fill_limit": 2,
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_end_before_start_is_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2021-01-01",
+                    "end_date": "2020-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_same_day_intraday_experiment_is_allowed() -> None:
+    """Inclusive date bounds may describe several intraday bars on one day."""
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "same_day",
+            "data": {
+                "instruments": [{"symbol": "SPY", "source": "csv", "calendar": "XNYS"}],
+                "start_date": "2024-01-02",
+                "end_date": "2024-01-02",
+                "frequency": "1h",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    assert cfg.start_date == cfg.end_date
+
+
+def test_same_day_non_intraday_experiment_is_rejected() -> None:
+    with pytest.raises(InvalidConfigurationError, match="only for intraday"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "same_day_daily",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2024-01-02",
+                    "end_date": "2024-01-02",
+                    "frequency": "1d",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_unknown_key_is_rejected() -> None:
+    """extra='forbid' catches typos in config keys."""
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "SPY", "source": "yahoo", "calendar": "XNYS"}
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "typo_field": 123,
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_missing_file_raises() -> None:
+    with pytest.raises(InvalidConfigurationError):
+        ExperimentConfig.from_yaml("configs/does_not_exist.yaml")
+
+
+def test_duplicate_yaml_key_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "duplicate.yaml"
+    path.write_text(
+        "experiment_name: first\nexperiment_name: second\n", encoding="utf-8"
+    )
+    with pytest.raises(InvalidConfigurationError, match="duplicate key"):
+        ExperimentConfig.from_yaml(path)
+
+
+def test_unreadable_yaml_is_wrapped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "unreadable.yaml"
+    path.write_text("experiment_name: x\n", encoding="utf-8")
+
+    def deny_read(self: Path, *args: object, **kwargs: object) -> str:
+        raise PermissionError("denied for test")
+
+    monkeypatch.setattr(Path, "read_text", deny_read)
+    with pytest.raises(InvalidConfigurationError, match="Could not read YAML config"):
+        ExperimentConfig.from_yaml(path)
+
+
+@pytest.mark.parametrize(
+    ("factory", "field"),
+    [
+        (lambda: BacktestConfig(initial_capital=True), "initial_capital"),
+        (lambda: ExecutionConfig(commission_bps=True), "commission_bps"),
+        (lambda: PortfolioConfig(maximum_weight=True), "maximum_weight"),
+        (lambda: ValidationConfig(train_window=True), "train_window"),
+        (lambda: ReproducibilityConfig(random_seed=True), "random_seed"),
+        (
+            lambda: ReproducibilityConfig(random_seed=cast(Any, np.bool_(True))),
+            "random_seed",
+        ),
+    ],
+)
+def test_boolean_is_rejected_for_numeric_fields(
+    factory: Callable[[], object], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        factory()
+
+
+def test_negative_random_seed_is_rejected() -> None:
+    with pytest.raises(ValueError, match="random_seed"):
+        ReproducibilityConfig(random_seed=-1)
+
+
+def test_custom_rebalancing_is_rejected_at_config_load() -> None:
+    with pytest.raises(ValueError, match=r"custom.*not implemented"):
+        PortfolioConfig(rebalance_frequency=cast(Any, "custom"))
+
+
+def test_holdout_validation_ratio_requires_test_ratio() -> None:
+    with pytest.raises(ValueError, match="validation_ratio has no effect"):
+        ValidationConfig(method=cast(Any, "holdout"), validation_ratio=0.2)
+
+
+def test_walk_forward_rejects_holdout_ratios() -> None:
+    with pytest.raises(ValueError, match="apply only to method 'holdout'"):
+        ValidationConfig(method=cast(Any, "walk_forward"), test_ratio=0.2)
+
+
+def test_periods_per_year_from_frequency() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"}
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "backtest": {"periods_per_year": 365},
+        }
+    )
+    assert cfg.periods_per_year == 365
+
+
+def test_periods_per_year_derived_from_uniform_calendar_without_override() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"}
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+        }
+    )
+    assert cfg.periods_per_year == 365
+
+
+def test_mixed_calendars_require_explicit_periods_per_year() -> None:
+    with pytest.raises(InvalidConfigurationError, match="Mixed market calendars"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                        {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+            }
+        )
+
+
+def test_immediate_after_close_rejects_a_session_based_instrument() -> None:
+    """Regression test: nothing derives a distinct overnight/intraday
+    matrix for `immediate_after_close` the way `next_bar_open` does -- it
+    is a plain no-op, so accepting it on a session-based (non-24/7)
+    market would silently produce results byte-identical to
+    `same_bar_close` while claiming a materially different, causally-
+    realizable execution assumption."""
+    with pytest.raises(InvalidConfigurationError, match="immediate_after_close"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "immediate_after_close"},
+            }
+        )
+
+
+def test_immediate_after_close_accepts_a_genuine_247_market() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "BTCUSDT", "source": "binance", "calendar": "24/7"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "execution": {"execution_timing": "immediate_after_close"},
+        }
+    )
+    assert cfg.execution.execution_timing == "immediate_after_close"
+
+
+def test_next_bar_open_rejects_a_weekly_frequency() -> None:
+    """RatioApproximatedExecutionPrices's open/close split is temporally
+    incoherent on a resampled bar (open from the first native day, close
+    from the last) -- next_bar_open must be rejected outright at any
+    frequency coarser than daily, not silently applied anyway."""
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "frequency": "1w",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_rejects_a_monthly_frequency() -> None:
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2021-01-01",
+                    "frequency": "1mo",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_rejects_an_hourly_frequency() -> None:
+    """Rejected for an independent reason from weekly/monthly: the
+    overnight-return derivation treats the previous ROW as the previous
+    session's close, which is wrong for an hourly bar (the previous row is
+    usually the previous hour within the same session)."""
+    with pytest.raises(InvalidConfigurationError, match="daily"):
+        ExperimentConfig.from_dict(
+            {
+                "experiment_name": "x",
+                "data": {
+                    "instruments": [
+                        {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                    ],
+                    "start_date": "2020-01-01",
+                    "end_date": "2020-01-02",
+                    "frequency": "1h",
+                },
+                "strategy": {"name": "buy_and_hold"},
+                "execution": {"execution_timing": "next_bar_open"},
+            }
+        )
+
+
+def test_next_bar_open_accepts_a_daily_frequency() -> None:
+    cfg = ExperimentConfig.from_dict(
+        {
+            "experiment_name": "x",
+            "data": {
+                "instruments": [
+                    {"symbol": "AAPL", "source": "yahoo", "calendar": "XNYS"},
+                ],
+                "start_date": "2020-01-01",
+                "end_date": "2021-01-01",
+                "frequency": "1d",
+            },
+            "strategy": {"name": "buy_and_hold"},
+            "execution": {"execution_timing": "next_bar_open"},
+        }
+    )
+    assert cfg.execution.execution_timing == "next_bar_open"
+
+
+@pytest.mark.parametrize(
+    ("frequency", "calendars", "expected"),
+    [
+        (
+            DataFrequency.D1,
+            ["XNYS"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.NEXT_BAR_OPEN},
+        ),
+        (DataFrequency.H1, ["XNYS"], {ExecutionTiming.SAME_BAR_CLOSE}),
+        (
+            DataFrequency.D1,
+            ["24/7"],
+            {
+                ExecutionTiming.SAME_BAR_CLOSE,
+                ExecutionTiming.NEXT_BAR_OPEN,
+                ExecutionTiming.IMMEDIATE_AFTER_CLOSE,
+            },
+        ),
+        (
+            DataFrequency.H1,
+            ["24/7"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.IMMEDIATE_AFTER_CLOSE},
+        ),
+        # A mixed universe (one session-based, one 24/7 instrument) is
+        # only as permissive as its most restrictive member for
+        # immediate_after_close -- every instrument must be 24/7, not
+        # just one -- but daily frequency alone is still enough for
+        # next_bar_open, which doesn't care about calendars at all.
+        (
+            DataFrequency.D1,
+            ["XNYS", "24/7"],
+            {ExecutionTiming.SAME_BAR_CLOSE, ExecutionTiming.NEXT_BAR_OPEN},
+        ),
+    ],
+    ids=["daily+xnys", "hourly+xnys", "daily+24/7", "hourly+24/7", "daily+mixed"],
+)
+def test_compatible_execution_timings_matrix(
+    frequency: DataFrequency, calendars: list[str], expected: set[ExecutionTiming]
+) -> None:
+    """Direct coverage of the full frequency x calendar eligibility
+    matrix ``compatible_execution_timings`` is the single source of
+    truth for -- both ``ExperimentConfig``'s own validators (see the
+    `test_next_bar_open_*`/`test_immediate_after_close_*` tests above,
+    which exercise the same rules end-to-end through config validation)
+    and the dashboard's execution-timing picker call this directly, so
+    testing it in isolation here covers combinations (daily/hourly x
+    24/7) that dashboard's own AppTest-based tests cannot drive (the
+    per-instrument Calendar column is a ``st.data_editor``, which this
+    Streamlit version's test harness cannot read or set)."""
+    assert compatible_execution_timings(frequency, calendars) == expected
+
+
+def test_yaml_roundtrip(sample_config: ExperimentConfig, tmp_path: Path) -> None:
+    out = sample_config.to_yaml(tmp_path / "cfg.yaml")
+    reloaded = ExperimentConfig.from_yaml(out)
+    assert reloaded == sample_config

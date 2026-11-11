@@ -1,0 +1,55 @@
+{
+  "date_utc": "2026-11-10",
+  "python": "3.13.3",
+  "versions": {
+    "numpy": "2.2.5",
+    "pandas": "2.2.3",
+    "scipy": "1.15.3",
+    "scikit-learn": "1.6.1",
+    "matplotlib": "3.10.8",
+    "tqdm": "4.67.1"
+  },
+  "new_downloads": 0,
+  "checks": {
+    "tests_passed": 23,
+    "tests_failed": 0,
+    "test_duration_seconds": 5.9,
+    "python_files_parsed": 16,
+    "original_backup_sha256_matches": 466,
+    "known_personal_marker_matches_outside_license_and_source_notice": 0,
+    "pickle_streams_structurally_inspected": 147,
+    "pickle_files_deserialized": 0,
+    "csv_datasets_inspected": 7
+  },
+  "baseline": "offline_analysis.json: chronological 182-day calibration / 60-day test, previous-day same-hour German prices, no neural training",
+  "repairs": [
+    "Exact finite-sample conformal rank and infinite small-sample correction",
+    "CQR tail ranks and copy-before-adjustment",
+    "CP multi-day forecast support and shape errors instead of process exit",
+    "Finite Kupiec likelihood for all-hit/all-miss observations",
+    "Correct coverage null-hypothesis label",
+    "NumPy 2 infinity compatibility",
+    "Legacy main guards prevent import-time experiments",
+    "Source attribution consolidated; local IDE settings private"
+  ],
+  "automatic_approval_review": {
+    "rejected_action": "Unrestricted pickle.load of archived forecasts",
+    "reason": "Deserialization can execute embedded code",
+    "alternative_completed": "Static pickletools inspection and CSV-only numerical baseline; no pickle object loading attempted again"
+  },
+  "unverified": [
+    "TensorFlow training and tuning",
+    "Saved neural forecast numerical contents and historical paper performance",
+    "Full ensemble/conformal postprocessing",
+    "Online controller behavior beyond infinity compatibility",
+    "Plots and DM-test reproduction",
+    "Historical full dependency installation"
+  ],
+  "limits": [
+    "Ordinary conformal coverage assumptions not established for dependent electricity prices",
+    "Coverage-test independence assumptions not established",
+    "New interval/statistic code differs from archived results",
+    "Legacy direct training/postprocessing can overwrite existing experiment paths"
+  ],
+  "source_attribution": "NOTICE.md and original license notices retained"
+}

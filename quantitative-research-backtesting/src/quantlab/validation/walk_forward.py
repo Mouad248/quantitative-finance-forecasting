@@ -1,0 +1,2191 @@
+"""Walk-forward parameter selection and out-of-sample evaluation."""
+
+from __future__ import annotations
+
+import itertools
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass, field
+from datetime import UTC, datetime
+from numbers import Integral, Real
+from pathlib import Path
+from typing import Any
+
+import numpy as np
+import pandas as pd
+from pydantic import ValidationError
+
+from quantlab.backtesting.accounting import (
+    AccountingResult,
+    compute_asset_returns,
+    portfolio_metrics_from_accounting,
+    run_accounting,
+)
+from quantlab.backtesting.benchmark import build_benchmark
+from quantlab.backtesting.engine import (
+    _dependency_versions,
+    _generator_hash,
+    _git_commit_hash,
+    _git_is_dirty,
+    _source_hash,
+)
+from quantlab.backtesting.execution_prices import (
+    ExecutionPriceSource,
+    adjusted_open_for_config,
+    execution_price_source_fingerprint,
+    execution_price_source_is_consulted,
+    overnight_returns_for_config,
+    reference_prices_for_config,
+)
+from quantlab.backtesting.result import BacktestResult
+from quantlab.backtesting.runner import (
+    build_execution_from_config,
+    build_strategy_from_config,
+    run_backtest_from_config,
+)
+from quantlab.backtesting.trade_log import build_trade_log
+from quantlab.config import (
+    BenchmarkKind,
+    ExperimentConfig,
+    RebalanceFrequency,
+)
+from quantlab.constants import SYMBOL
+from quantlab.data.base import price_matrix
+from quantlab.data.calendar import uniform_calendar
+from quantlab.data.closures import DAILY_FREQUENCY, tradable_mask_for
+from quantlab.data.storage import ParquetStorage
+from quantlab.exceptions import InvalidConfigurationError
+from quantlab.execution.execution_model import ExecutionModel
+from quantlab.execution.orders import executed_weights as compute_executed_weights
+from quantlab.execution.orders import shift_respecting_tradability
+from quantlab.logging_config import get_logger
+from quantlab.portfolio.rebalancing import (
+    rebalance_and_cap_turnover,
+)
+from quantlab.portfolio.rebalancing import (
+    rebalance_dates as compute_rebalance_dates,
+)
+from quantlab.risk import metrics as M
+from quantlab.risk._validation import boolean, finite_real, positive_int
+from quantlab.strategies import strategy_parameter_names
+from quantlab.validation.checkpoint import (
+    clear_checkpoint,
+    compute_provenance,
+    load_checkpoint,
+    save_checkpoint,
+)
+from quantlab.validation.splits import WalkForwardWindow, walk_forward_windows
+
+logger = get_logger(__name__)
+
+# A common signature ensures risk-adjusted scorers receive the configured
+# annual risk-free rate.
+_SCORERS: dict[str, Callable[[pd.Series, pd.Series, int, float], float]] = {
+    "sharpe": lambda returns, equity, ppy, rf: M.sharpe_ratio(returns, rf, ppy),
+    "sortino": lambda returns, equity, ppy, rf: M.sortino_ratio(returns, rf, ppy),
+    "calmar": lambda returns, equity, ppy, rf: M.calmar_ratio(equity, ppy),
+    "total_return": lambda returns, equity, ppy, rf: M.total_return(equity),
+}
+
+
+@dataclass
+class FoldResult:
+    """Selected parameters and realised metrics for one OOS interval."""
+
+    fold: int
+    best_params: dict[str, Any]
+    validation_score: float
+    test_return: float
+    test_sharpe: float
+    test_returns: pd.Series
+
+
+@dataclass
+class WalkForwardResult:
+    """Aggregated walk-forward output."""
+
+    folds: list[FoldResult] = field(default_factory=list)
+    oos_returns: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    oos_equity: pd.Series = field(default_factory=lambda: pd.Series(dtype=float))
+    # A genuine BacktestResult built from the stitched out-of-sample series,
+    # reusing the same trade-log/benchmark/metrics pipeline as a single
+    # backtest so existing result-rendering code (dashboard, HTML report)
+    # works unchanged. `None` only when no fold produced any OOS weights.
+    oos_result: BacktestResult | None = None
+
+    def summary_table(self) -> pd.DataFrame:
+        """Return selected parameters and OOS metrics for each fold."""
+        rows = [
+            {
+                "fold": fold.fold,
+                **{f"param_{key}": value for key, value in fold.best_params.items()},
+                "validation_score": fold.validation_score,
+                "test_return": fold.test_return,
+                "test_sharpe": fold.test_sharpe,
+            }
+            for fold in self.folds
+        ]
+        return pd.DataFrame(rows)
+
+    def parameter_stability(self) -> dict[str, float]:
+        """Return coefficients of variation for finite numeric choices.
+
+        Lower values mean that selection varied less across folds, but do not
+        by themselves establish strategy robustness.
+        """
+        if not self.folds:
+            return {}
+        stability: dict[str, float] = {}
+        for key in self.folds[0].best_params:
+            values: list[float] = []
+            for fold in self.folds:
+                value = fold.best_params.get(key)
+                if (
+                    isinstance(value, Real)
+                    and not isinstance(value, (bool, np.bool_))
+                    and np.isfinite(float(value))
+                ):
+                    values.append(float(value))
+            mean = float(np.mean(values)) if values else 0.0
+            if len(values) >= 2 and not np.isclose(mean, 0.0):
+                stability[key] = float(np.std(values) / abs(mean))
+        return stability
+
+    def oos_metrics(
+        self, periods_per_year: int = 252, risk_free_rate: float = 0.0
+    ) -> dict[str, float]:
+        """Compute metrics for the stitched out-of-sample curve."""
+        if len(self.oos_returns) < 2:
+            return {}
+        return M.compute_metrics(
+            self.oos_returns,
+            self.oos_equity,
+            risk_free_rate=risk_free_rate,
+            periods_per_year=periods_per_year,
+        )
+
+
+@dataclass
+class _FoldCandidateWeights:
+    """One candidate's cost-independent weights, cached for one fold.
+
+    ``None`` fields mean this candidate was skipped for insufficient
+    train/validation warm-up on this fold (mirrors ``_select_on_validation``'s
+    own skip condition).
+    """
+
+    validation_weights: pd.DataFrame | None
+    test_targets: pd.DataFrame | None
+
+
+def _windows_match(a: WalkForwardWindow, b: WalkForwardWindow) -> bool:
+    """Compare two windows field-by-field, never via ``==`` directly.
+
+    ``WalkForwardWindow`` is a plain ``@dataclass(frozen=True)`` with
+    ``pd.DatetimeIndex`` fields -- its auto-generated ``__eq__`` compares
+    field tuples, and ``DatetimeIndex.__eq__`` returns an element-wise
+    boolean array rather than a scalar, which raises ``ValueError`` the
+    moment Python's tuple comparison needs a single bool out of it for any
+    index longer than one element. ``Index.equals`` is the correct,
+    scalar-returning comparison for this exact reason.
+    """
+    return (
+        a.fold == b.fold
+        and a.train.equals(b.train)
+        and a.validation.equals(b.validation)
+        and a.test.equals(b.test)
+    )
+
+
+def _target_frame_is_valid(
+    target: object, expected_columns: set[str], expected_index: pd.DatetimeIndex
+) -> bool:
+    """Return whether a checkpointed target-weights frame is trustworthy.
+
+    Checks the actual content, not just ``isinstance(target, pd.DataFrame)``
+    -- the wrong symbol set, an index that doesn't match this fold's own
+    window exactly (a corrupted or unrelated checkpoint could carry a
+    subset, a reordering, or a stray date from a completely different run,
+    e.g. the year 1900), or a non-finite value would otherwise silently
+    corrupt the stitched OOS curve. Dtypes are checked as numeric *before*
+    attempting a float cast, so a frame holding genuinely non-numeric data
+    (e.g. object/string columns) fails cleanly here rather than raising out
+    of this check.
+    """
+    if not isinstance(target, pd.DataFrame):
+        return False
+    if set(target.columns) != expected_columns:
+        return False
+    if not pd.Index(target.index).equals(pd.DatetimeIndex(expected_index)):
+        return False
+    if not all(pd.api.types.is_numeric_dtype(dtype) for dtype in target.dtypes):
+        return False
+    return bool(np.isfinite(target.to_numpy(dtype=float)).all())
+
+
+def _candidate_weights_is_valid(
+    candidate: object,
+    expected_columns: set[str],
+    validation_index: pd.DatetimeIndex,
+    test_index: pd.DatetimeIndex,
+) -> bool:
+    """Return whether a cached candidate's weights are internally consistent.
+
+    ``_FoldCandidateWeights``'s own docstring says ``None`` fields mean this
+    candidate was skipped (insufficient warm-up) -- both fields must agree
+    on that: one ``None`` and the other a real DataFrame is not a state
+    this code ever produces itself, only a corrupted or hand-edited
+    checkpoint could, and trusting it risks silently mixing a skipped
+    candidate's missing weights into a scenario that expects them. When both
+    fields are present, each is checked with the same full-content rigor as
+    ``_target_frame_is_valid`` (exact symbol set, exact index against this
+    fold's own validation/test window, finite values) -- a right-shaped but
+    wrong-content frame (foreign dates, garbage columns, NaNs) is just as
+    unsafe to resume from as a missing one.
+    """
+    if not isinstance(candidate, _FoldCandidateWeights):
+        return False
+    if candidate.validation_weights is None and candidate.test_targets is None:
+        return True
+    return _target_frame_is_valid(
+        candidate.validation_weights, expected_columns, validation_index
+    ) and _target_frame_is_valid(candidate.test_targets, expected_columns, test_index)
+
+
+@dataclass
+class WalkForwardWeightCache:
+    """Per-fold, per-candidate weights captured while selecting a baseline.
+
+    Signal generation and portfolio allocation never depend on execution
+    costs (commission/spread/slippage) — only the accounting step does (see
+    :meth:`WalkForwardValidator.rescore_with_costs`). Built by
+    :meth:`WalkForwardValidator.run_with_weight_cache`.
+    """
+
+    data: pd.DataFrame
+    combinations: list[dict[str, Any]]
+    fold_windows: list[WalkForwardWindow]
+    candidates: list[list[_FoldCandidateWeights]]
+    grid: Mapping[str, Sequence[Any]]
+    train_window: int
+    validation_window: int
+    test_window: int
+    step: int
+    expanding: bool
+    execution_delay: int
+    #: The config this cache's weights/candidates were actually computed
+    #: from -- rescore_with_costs() checks a scenario config against this,
+    #: not just documents the requirement, so a scenario that silently
+    #: also changes signals/universe/selection (not just execution costs)
+    #: is rejected instead of producing quietly wrong results from stale
+    #: cached weights.
+    base_config: ExperimentConfig
+    #: Fingerprint (see execution_price_source_fingerprint) of the
+    #: execution_price_source this cache's target weights were actually
+    #: computed under -- rescore_with_costs() checks the rescoring
+    #: validator's own source against this, so a caller that rescores the
+    #: same cache from a differently-configured validator instance gets a
+    #: clear error instead of a silent, provenance-inconsistent result.
+    execution_price_source_fingerprint: str
+
+
+def resolve_walk_forward_windows(
+    config: ExperimentConfig,
+) -> tuple[int, int, int, int]:
+    """Resolve train/validation/test/step windows, applying documented defaults.
+
+    Shared by the CLI, dashboard and walk-forward-aware robustness/sensitivity
+    functions so the 500/126/126 fallback (and ``step``'s own default of
+    "equal to the resolved test_window", reproducing the original
+    non-overlapping-folds behaviour) lives in exactly one place.
+    """
+    test_window = config.validation.test_window or 126
+    return (
+        config.validation.train_window or 500,
+        config.validation.validation_window or 126,
+        test_window,
+        config.validation.step or test_window,
+    )
+
+
+def _with_params(config: ExperimentConfig, params: dict[str, Any]) -> ExperimentConfig:
+    """Return a revalidated config with strategy parameters overridden."""
+    merged = {**config.strategy.parameters, **params}
+    try:
+        strategy = config.strategy.revalidated_copy(update={"parameters": merged})
+        return config.revalidated_copy(update={"strategy": strategy})
+    except ValidationError as exc:
+        raise InvalidConfigurationError(
+            f"Invalid walk-forward parameter combination {params}: {exc}"
+        ) from exc
+
+
+@dataclass
+class _PreparedWalkForward:
+    """Validated inputs shared by run() and run_with_weight_cache()."""
+
+    tradable: pd.DataFrame
+    windows: list[WalkForwardWindow]
+    combinations: list[dict[str, Any]]
+    periods_per_year: int
+    risk_free_rate: float
+    scorer: Callable[[pd.Series, pd.Series, int, float], float]
+    grid: dict[str, Sequence[Any]]
+    delay: int
+    step: int
+
+
+class WalkForwardValidator:
+    """Select parameters on validation blocks and evaluate them OOS."""
+
+    def __init__(
+        self,
+        base_config: ExperimentConfig,
+        *,
+        execution_price_source: ExecutionPriceSource | None = None,
+    ) -> None:
+        """Store the base config, and optionally an execution-price source.
+
+        Args:
+            base_config: Experiment configuration.
+            execution_price_source: Forwarded to every internal
+                ``overnight_returns_for_config`` call this validator makes
+                (fold selection, OOS stitching, and
+                :meth:`rescore_with_costs`) -- the same parameter
+                :meth:`BacktestEngine.run` accepts, so a custom source
+                given to a single backtest is honoured identically by a
+                validator constructed with the same source over the same
+                config. ``None`` (default) uses
+                ``RatioApproximatedExecutionPrices``, matching a plain
+                ``BacktestEngine.run()`` call given no override.
+        """
+        if not isinstance(base_config, ExperimentConfig):
+            raise TypeError("base_config must be an ExperimentConfig.")
+        self.base_config = base_config
+        self.execution_price_source = execution_price_source
+
+    def run(
+        self,
+        data: pd.DataFrame,
+        parameter_grid: Mapping[str, Sequence[Any]],
+        train_window: int,
+        validation_window: int,
+        test_window: int,
+        *,
+        expanding: bool = True,
+        step: int | None = None,
+        execution_delay: int = 0,
+        on_progress: Callable[[int, int], None] | None = None,
+        checkpoint_path: Path | None = None,
+    ) -> WalkForwardResult:
+        """Execute chronological parameter selection and OOS accounting.
+
+        Args:
+            data: Canonical long OHLCV frame.
+            parameter_grid: Candidate values per strategy parameter to select
+                on each fold's validation block.
+            train_window: Training periods per fold.
+            validation_window: Validation periods per fold, used for
+                parameter selection.
+            test_window: Out-of-sample test periods per fold.
+            expanding: Grow the training window across folds instead of
+                sliding it.
+            step: Periods to advance between consecutive folds' train
+                windows. ``None`` (default) equals ``test_window``, so test
+                blocks are contiguous and never overlap. A smaller step
+                overlaps test blocks; ``step`` must not exceed
+                ``test_window`` (a larger step would leave gaps that
+                CAGR/annualisation cannot account for).
+            on_progress: Optional callback invoked as ``on_progress(done,
+                total)`` once before the first candidate (``done=0``, or the
+                resumed count if ``checkpoint_path`` supplied a partial run)
+                and once after each candidate is considered plus once more
+                after each fold's out-of-sample weights are computed —
+                ``total`` being folds x (grid size + 1), matching
+                ``estimate_walk_forward_backtest_count`` — for a caller (e.g.
+                the dashboard) to drive a live progress bar instead of
+                estimating a duration upfront. One tick per whole fold was
+                too coarse in practice: a fold's own grid search can take
+                long enough that a caller's pace estimate had too few, too
+                lumpy data points to track a real, sustained slowdown across
+                an expanding walk-forward's later, bigger folds.
+            execution_delay: Extra periods of execution delay applied to both
+                validation-block parameter selection and the final
+                out-of-sample weights (the "acting on stale signals" stress
+                scenario, re-run through the whole selection process rather
+                than only rescaling the final numbers).
+            checkpoint_path: Optional path to persist per-fold progress to,
+                so an interrupted run resumes from its last completed fold
+                instead of starting over. Silently ignored (fresh start) if
+                nothing valid is there yet; automatically cleared once this
+                call completes. See ``quantlab.validation.checkpoint``.
+        """
+        started = time.perf_counter()
+        expanding = boolean(expanding, name="expanding")
+        prepared = self._prepare(
+            data,
+            parameter_grid,
+            train_window,
+            validation_window,
+            test_window,
+            expanding=expanding,
+            step=step,
+            execution_delay=execution_delay,
+        )
+        step = prepared.step
+
+        fold_windows: list[WalkForwardWindow] = []
+        fold_parameters: list[dict[str, Any]] = []
+        fold_scores: list[float] = []
+        target_pieces: list[pd.DataFrame] = []
+
+        provenance: dict[str, Any] | None = None
+
+        def _validate_fold_state(state: Any, progress: int) -> bool:
+            # A structurally-plausible-but-incoherent checkpoint (right
+            # list count, wrong content) must never be resumed from: e.g. a
+            # `progress` that disagrees with the lists' own length, windows
+            # left over from a *different* run whose windows happen to
+            # share this one's length, or a target frame surviving from a
+            # completely different fold. Content, not just count, is
+            # checked -- windows must exactly match this run's own
+            # `prepared.windows` prefix, in order. The whole body is
+            # wrapped defensively: a checkpoint's *content* is untrusted
+            # data by definition (it can be replaced or hand-edited on
+            # disk), so any unexpected shape while inspecting it -- not
+            # only a failed check -- must resolve to "untrusted", the same
+            # philosophy `_read_payload` already applies to a malformed
+            # pickle, never propagate an exception into the caller.
+            try:
+                if not (isinstance(state, tuple) and len(state) == 4):
+                    return False
+                windows, parameters, scores, targets = state
+                if not all(isinstance(piece, list) for piece in state):
+                    return False
+                lengths = {len(piece) for piece in state}
+                if len(lengths) != 1:
+                    return False
+                count = lengths.pop()
+                if not (progress == count <= len(prepared.windows)):
+                    return False
+                if not all(
+                    isinstance(window, WalkForwardWindow)
+                    and _windows_match(window, prepared.windows[position])
+                    for position, window in enumerate(windows)
+                ):
+                    return False
+                # `params in prepared.combinations` (not just
+                # isinstance(dict)): a parameter dict that isn't actually
+                # one of this run's own grid candidates could only have
+                # come from a stale or unrelated checkpoint.
+                if not all(params in prepared.combinations for params in parameters):
+                    return False
+                if not all(
+                    isinstance(score, (int, float))
+                    and not isinstance(score, bool)
+                    and np.isfinite(score)
+                    for score in scores
+                ):
+                    return False
+                # A target frame's own columns/index/values matter here, not
+                # just its Python type -- the wrong symbol set, dates
+                # outside this fold's own test window (e.g. a stray 1900
+                # timestamp), or a non-finite value would otherwise silently
+                # corrupt the stitched OOS curve.
+                symbols = set(self.base_config.symbols)
+                return all(
+                    _target_frame_is_valid(target, symbols, window.test)
+                    for target, window in zip(targets, windows, strict=True)
+                )
+            except Exception:
+                return False
+
+        if checkpoint_path is not None:
+            provenance = compute_provenance(
+                self.base_config,
+                data,
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                step=step,
+                expanding=expanding,
+                execution_delay=execution_delay,
+                parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+                # Not captured by `self.base_config` itself -- a custom,
+                # non-default source given to this validator's constructor
+                # changes what a resumed run computes exactly like
+                # `execution_price_source_fingerprint` in the final
+                # result's own metadata already tracks, so resuming under
+                # a DIFFERENT source (or the SAME class with different
+                # parameters -- see `execution_price_source_fingerprint`'s
+                # own docstring) than the one that produced the checkpoint
+                # must be detected as stale rather than silently mixing
+                # the two.
+                execution_price_source_fingerprint=execution_price_source_fingerprint(
+                    self.execution_price_source
+                ),
+            )
+            checkpoint_result = load_checkpoint(
+                checkpoint_path, provenance, validate=_validate_fold_state
+            )
+            if checkpoint_result is not None:
+                (fold_windows, fold_parameters, fold_scores, target_pieces), _ = (
+                    checkpoint_result
+                )
+                logger.info(
+                    "Resuming walk-forward from checkpoint: %d/%d folds already done.",
+                    len(fold_windows),
+                    len(prepared.windows),
+                )
+        resumed_folds = len(fold_windows)
+
+        # One tick per candidate considered plus one for the fold's final
+        # out-of-sample weights, not one tick per whole fold: see the
+        # on_progress docstring above for why the coarser version made a
+        # caller's live pace estimate too imprecise.
+        total_units = len(prepared.windows) * (len(prepared.combinations) + 1)
+        units_done = resumed_folds * (len(prepared.combinations) + 1)
+        if on_progress is not None:
+            on_progress(units_done, total_units)
+
+        def _tick() -> None:
+            nonlocal units_done
+            units_done += 1
+            if on_progress is not None:
+                on_progress(units_done, total_units)
+
+        for window in prepared.windows[resumed_folds:]:
+            best = self._select_on_validation(
+                data,
+                window,
+                prepared.combinations,
+                prepared.scorer,
+                prepared.periods_per_year,
+                prepared.risk_free_rate,
+                execution_delay=prepared.delay,
+                on_candidate=_tick,
+            )
+            targets = self._weights_on_test(data, window, best["params"])
+            fold_windows.append(window)
+            fold_parameters.append(best["params"])
+            fold_scores.append(best["score"])
+            _tick()
+            target_pieces.append(targets)
+            if checkpoint_path is not None and provenance is not None:
+                save_checkpoint(
+                    checkpoint_path,
+                    provenance,
+                    (fold_windows, fold_parameters, fold_scores, target_pieces),
+                    len(fold_windows),
+                )
+
+        result = self._finalize(
+            fold_windows,
+            fold_parameters,
+            fold_scores,
+            target_pieces,
+            prepared.tradable,
+            data,
+            self.base_config,
+            prepared.periods_per_year,
+            prepared.risk_free_rate,
+            prepared.delay,
+            prepared.grid,
+            train_window,
+            validation_window,
+            test_window,
+            step,
+            expanding,
+            started,
+        )
+        if checkpoint_path is not None:
+            clear_checkpoint(checkpoint_path)
+        return result
+
+    def run_with_weight_cache(
+        self,
+        data: pd.DataFrame,
+        parameter_grid: Mapping[str, Sequence[Any]],
+        train_window: int,
+        validation_window: int,
+        test_window: int,
+        *,
+        expanding: bool = True,
+        step: int | None = None,
+        execution_delay: int = 0,
+        on_progress: Callable[[int, int], None] | None = None,
+        checkpoint_path: Path | None = None,
+    ) -> tuple[WalkForwardResult, WalkForwardWeightCache]:
+        """Like :meth:`run`, but also return a cache of per-candidate weights.
+
+        Signal generation and portfolio allocation never depend on execution
+        costs, so a scenario that only rescales commission/spread/slippage
+        can reuse the returned cache via :meth:`rescore_with_costs` instead
+        of paying for a full walk-forward re-run. Building the cache
+        computes out-of-sample target weights for every candidate on every
+        fold (not only each fold's winner, since a different candidate can
+        win once costs change), so this method itself costs somewhat more
+        than :meth:`run` — the saving comes from amortising that extra cost
+        across every cost-only scenario that reuses the cache instead of
+        paying for a full re-run each.
+
+        Args: as :meth:`run`, except ``on_progress`` is reported per
+            candidate evaluated (``total`` = folds x candidates) rather than
+            per fold, since this method does roughly twice the work of
+            :meth:`run` per fold. ``checkpoint_path``, if given, checkpoints
+            per fold (a fold's cached candidates are only ever used or
+            dropped as a whole) — an interruption while this cache is being
+            built resumes at the right fold instead of recomputing it from
+            scratch, which matters here specifically because building it is
+            the expensive part the cost-only stress scenarios are meant to
+            amortise.
+        """
+        started = time.perf_counter()
+        expanding = boolean(expanding, name="expanding")
+        prepared = self._prepare(
+            data,
+            parameter_grid,
+            train_window,
+            validation_window,
+            test_window,
+            expanding=expanding,
+            step=step,
+            execution_delay=execution_delay,
+        )
+        step = prepared.step
+
+        fold_windows: list[WalkForwardWindow] = []
+        fold_parameters: list[dict[str, Any]] = []
+        fold_scores: list[float] = []
+        target_pieces: list[pd.DataFrame] = []
+        cached_candidates: list[list[_FoldCandidateWeights]] = []
+
+        provenance: dict[str, Any] | None = None
+
+        def _validate_cache_fold_state(state: Any, progress: int) -> bool:
+            # Same reasoning as the plain run()'s _validate_fold_state
+            # (including the defensive try/except -- checkpoint content is
+            # untrusted data by definition), for this method's own 5-list
+            # state shape (it additionally caches every candidate's
+            # test-block weights, not just the winner's).
+            try:
+                if not (isinstance(state, tuple) and len(state) == 5):
+                    return False
+                windows, parameters, scores, targets, cached = state
+                if not all(isinstance(piece, list) for piece in state):
+                    return False
+                lengths = {len(piece) for piece in state}
+                if len(lengths) != 1:
+                    return False
+                count = lengths.pop()
+                if not (progress == count <= len(prepared.windows)):
+                    return False
+                if not all(
+                    isinstance(window, WalkForwardWindow)
+                    and _windows_match(window, prepared.windows[position])
+                    for position, window in enumerate(windows)
+                ):
+                    return False
+                if not all(params in prepared.combinations for params in parameters):
+                    return False
+                if not all(
+                    isinstance(score, (int, float))
+                    and not isinstance(score, bool)
+                    and np.isfinite(score)
+                    for score in scores
+                ):
+                    return False
+                symbols = set(self.base_config.symbols)
+                if not all(
+                    _target_frame_is_valid(target, symbols, window.test)
+                    for target, window in zip(targets, windows, strict=True)
+                ):
+                    return False
+                # Every fold's cache must hold exactly one entry per
+                # candidate in this run's own grid -- a mismatched count
+                # means it was built against a different (or
+                # since-changed) parameter_grid.
+                return all(
+                    isinstance(fold_cache, list)
+                    and len(fold_cache) == len(prepared.combinations)
+                    and all(
+                        _candidate_weights_is_valid(
+                            candidate, symbols, window.validation, window.test
+                        )
+                        for candidate in fold_cache
+                    )
+                    for window, fold_cache in zip(windows, cached, strict=True)
+                )
+            except Exception:
+                return False
+
+        if checkpoint_path is not None:
+            provenance = compute_provenance(
+                self.base_config,
+                data,
+                train_window=train_window,
+                validation_window=validation_window,
+                test_window=test_window,
+                step=step,
+                expanding=expanding,
+                execution_delay=execution_delay,
+                parameter_grid={k: list(v) for k, v in parameter_grid.items()},
+                # Not captured by `self.base_config` itself -- a custom,
+                # non-default source given to this validator's constructor
+                # changes what a resumed run computes exactly like
+                # `execution_price_source_fingerprint` in the final
+                # result's own metadata already tracks, so resuming under
+                # a DIFFERENT source (or the SAME class with different
+                # parameters -- see `execution_price_source_fingerprint`'s
+                # own docstring) than the one that produced the checkpoint
+                # must be detected as stale rather than silently mixing
+                # the two.
+                execution_price_source_fingerprint=execution_price_source_fingerprint(
+                    self.execution_price_source
+                ),
+            )
+            checkpoint_result = load_checkpoint(
+                checkpoint_path, provenance, validate=_validate_cache_fold_state
+            )
+            if checkpoint_result is not None:
+                (
+                    (
+                        fold_windows,
+                        fold_parameters,
+                        fold_scores,
+                        target_pieces,
+                        cached_candidates,
+                    ),
+                    _,
+                ) = checkpoint_result
+                logger.info(
+                    "Resuming weight-cache build from checkpoint: %d/%d folds "
+                    "already done.",
+                    len(fold_windows),
+                    len(prepared.windows),
+                )
+        resumed_folds = len(fold_windows)
+
+        # Reported per candidate evaluated, not per fold: this method does
+        # roughly twice the work of run() per fold (it also captures every
+        # candidate's test-block targets, not only the winner's), so
+        # fold-level ticks alone could go a long time between updates —
+        # especially with few folds — and look stalled to a caller like the
+        # dashboard's progress bar.
+        total_candidates = len(prepared.windows) * len(prepared.combinations)
+        candidates_done = resumed_folds * len(prepared.combinations)
+        if on_progress is not None:
+            on_progress(candidates_done, total_candidates)
+        for window in prepared.windows[resumed_folds:]:
+
+            def _tick() -> None:
+                nonlocal candidates_done
+                candidates_done += 1
+                if on_progress is not None:
+                    on_progress(candidates_done, total_candidates)
+
+            best_index, score, captured = self._select_and_capture(
+                data,
+                window,
+                prepared.combinations,
+                prepared.scorer,
+                prepared.periods_per_year,
+                prepared.risk_free_rate,
+                execution_delay=prepared.delay,
+                on_candidate=_tick,
+            )
+            fold_windows.append(window)
+            fold_parameters.append(prepared.combinations[best_index])
+            fold_scores.append(score)
+            cached_candidates.append(captured)
+            test_targets = captured[best_index].test_targets
+            assert test_targets is not None
+            target_pieces.append(test_targets)
+            if checkpoint_path is not None and provenance is not None:
+                save_checkpoint(
+                    checkpoint_path,
+                    provenance,
+                    (
+                        fold_windows,
+                        fold_parameters,
+                        fold_scores,
+                        target_pieces,
+                        cached_candidates,
+                    ),
+                    len(fold_windows),
+                )
+
+        result = self._finalize(
+            fold_windows,
+            fold_parameters,
+            fold_scores,
+            target_pieces,
+            prepared.tradable,
+            data,
+            self.base_config,
+            prepared.periods_per_year,
+            prepared.risk_free_rate,
+            prepared.delay,
+            prepared.grid,
+            train_window,
+            validation_window,
+            test_window,
+            step,
+            expanding,
+            started,
+        )
+        cache = WalkForwardWeightCache(
+            data=data,
+            combinations=prepared.combinations,
+            fold_windows=fold_windows,
+            candidates=cached_candidates,
+            grid=prepared.grid,
+            train_window=train_window,
+            validation_window=validation_window,
+            test_window=test_window,
+            step=step,
+            expanding=expanding,
+            execution_delay=prepared.delay,
+            base_config=self.base_config,
+            execution_price_source_fingerprint=execution_price_source_fingerprint(
+                self.execution_price_source
+            ),
+        )
+        if checkpoint_path is not None:
+            clear_checkpoint(checkpoint_path)
+        return result, cache
+
+    def rescore_with_costs(
+        self,
+        cache: WalkForwardWeightCache,
+        scenario_config: ExperimentConfig,
+    ) -> WalkForwardResult:
+        """Cheaply re-score an execution-only scenario against a cached baseline.
+
+        For every cached candidate on every fold, this re-runs only the
+        accounting step under ``scenario_config``'s execution model — never
+        the signal/allocation computation that produced the cached weights
+        — to re-select each fold's winner, which can differ from the
+        original selection since a stressed cost (or a different
+        ``execution_timing``) can change which candidate scores best. It
+        then stitches the out-of-sample series exactly as :meth:`run`
+        would from a fresh full re-run.
+
+        Only valid when ``scenario_config`` differs from the config that
+        built ``cache`` within the ``execution`` section as a whole
+        (commission/spread/slippage/slippage_model/impact_coefficient/
+        execution_timing) -- every one of those is genuinely safe to vary
+        here: none of them can change the cached weights themselves (only
+        how they're accounted for), and ``execution_timing`` specifically
+        is re-derived fresh from ``scenario_config`` on every fold (see
+        ``overnight_returns_for_config`` below), never inherited from
+        whatever timing built the cache. Anything OUTSIDE that section
+        that would change signals, weights, the tradable universe or
+        selection needs a fresh :meth:`run` or :meth:`run_with_weight_
+        cache` instead -- enforced below, not just documented: a mismatch
+        on any other field raises rather than silently rescoring against
+        stale cached weights that don't actually reflect what the
+        scenario claims to be.
+
+        Raises:
+            InvalidConfigurationError: If ``scenario_config`` differs from
+                ``cache.base_config`` outside the ``execution`` section, or
+                if this validator's own ``execution_price_source`` differs
+                from the one that built ``cache``.
+        """
+        base_dump = cache.base_config.model_dump(mode="json")
+        scenario_dump = scenario_config.model_dump(mode="json")
+        base_dump.pop("execution", None)
+        scenario_dump.pop("execution", None)
+        if base_dump != scenario_dump:
+            raise InvalidConfigurationError(
+                "rescore_with_costs() requires scenario_config to match the "
+                "config that built cache in every respect except the "
+                "execution section (commission/spread/slippage/"
+                "slippage_model/impact_coefficient/execution_timing) -- "
+                "this scenario also changes something that could change "
+                "signals, weights, the tradable universe or selection. Use "
+                "run() or run_with_weight_cache() instead."
+            )
+        if (
+            execution_price_source_fingerprint(self.execution_price_source)
+            != cache.execution_price_source_fingerprint
+        ):
+            raise InvalidConfigurationError(
+                "rescore_with_costs() requires this validator's own "
+                "execution_price_source to match the one that built cache "
+                "-- rescoring from a differently-sourced validator would "
+                "silently mix target weights computed under one source "
+                "with accounting computed under another. Call "
+                "run_with_weight_cache() on a validator constructed with "
+                "the same execution_price_source instead."
+            )
+
+        started = time.perf_counter()
+        periods_per_year = positive_int(
+            scenario_config.periods_per_year, name="periods_per_year"
+        )
+        risk_free_rate = finite_real(
+            scenario_config.backtest.risk_free_rate, name="risk_free_rate"
+        )
+        metric = scenario_config.validation.optimization_metric
+        try:
+            scorer = _SCORERS[metric]
+        except KeyError as exc:
+            raise InvalidConfigurationError(
+                f"Unsupported walk-forward optimization metric: {metric!r}."
+            ) from exc
+
+        tradable = cache.data[cache.data[SYMBOL].isin(set(scenario_config.symbols))]
+        accounting_kwargs = _accounting_kwargs_for_config(scenario_config)
+        shared_calendar = uniform_calendar(
+            instrument.calendar for instrument in scenario_config.data.instruments
+        )
+        fold_parameters: list[dict[str, Any]] = []
+        fold_scores: list[float] = []
+        target_pieces: list[pd.DataFrame] = []
+        for window, row in zip(cache.fold_windows, cache.candidates, strict=True):
+            sliced = _slice_between(cache.data, window.train[0], window.validation[-1])
+            fold_tradable = sliced[sliced[SYMBOL].isin(set(scenario_config.symbols))]
+            prices = price_matrix(fold_tradable, adjusted=True)
+            asset_returns = compute_asset_returns(prices).loc[
+                window.validation[0] : window.validation[-1]
+            ]
+            execution_model = build_execution_from_config(scenario_config, sliced)
+            tradable_mask = _tradable_mask_if_mixed_calendar(
+                scenario_config, pd.DatetimeIndex(asset_returns.index)
+            )
+            # Loop-invariant across every candidate below (same as
+            # asset_returns/execution_model/tradable_mask above it) --
+            # computed once per fold, not once per candidate.
+            overnight_returns = overnight_returns_for_config(
+                scenario_config,
+                fold_tradable,
+                prices,
+                execution_price_source=self.execution_price_source,
+            )
+
+            best_score = -np.inf
+            best_index: int | None = None
+            for index, candidate in enumerate(row):
+                if candidate.validation_weights is None:
+                    continue
+                aligned_tradable = (
+                    tradable_mask.reindex(
+                        index=candidate.validation_weights.index,
+                        columns=candidate.validation_weights.columns,
+                    ).fillna(True)
+                    if tradable_mask is not None
+                    else None
+                )
+                accounting = run_accounting(
+                    candidate.validation_weights,
+                    asset_returns,
+                    execution_model,
+                    scenario_config.initial_capital,
+                    tradable=aligned_tradable,
+                    rebalance_date=_rebalance_date_for_run_accounting(
+                        candidate.validation_weights,
+                        scenario_config.portfolio.rebalance_frequency,
+                        shared_calendar,
+                        aligned_tradable,
+                        0,
+                    ),
+                    overnight_returns=overnight_returns,
+                    **accounting_kwargs,
+                )
+                equity = M.equity_from_returns(accounting.net_returns)
+                score = scorer(
+                    accounting.net_returns, equity, periods_per_year, risk_free_rate
+                )
+                if np.isfinite(score) and score > best_score:
+                    best_score = score
+                    best_index = index
+            if best_index is None:
+                raise InvalidConfigurationError(
+                    f"Fold {window.fold}: every cached parameter combination "
+                    "produced a non-finite validation score under this "
+                    "scenario's execution costs."
+                )
+            fold_parameters.append(cache.combinations[best_index])
+            fold_scores.append(best_score)
+            test_targets = row[best_index].test_targets
+            assert test_targets is not None
+            target_pieces.append(test_targets)
+
+        return self._finalize(
+            cache.fold_windows,
+            fold_parameters,
+            fold_scores,
+            target_pieces,
+            tradable,
+            cache.data,
+            scenario_config,
+            periods_per_year,
+            risk_free_rate,
+            cache.execution_delay,
+            cache.grid,
+            cache.train_window,
+            cache.validation_window,
+            cache.test_window,
+            cache.step,
+            cache.expanding,
+            started,
+        )
+
+    def _prepare(
+        self,
+        data: pd.DataFrame,
+        parameter_grid: Mapping[str, Sequence[Any]],
+        train_window: int,
+        validation_window: int,
+        test_window: int,
+        *,
+        expanding: bool,
+        execution_delay: int,
+        step: int | None = None,
+    ) -> _PreparedWalkForward:
+        """Validate inputs and compute what run() and run_with_weight_cache() share."""
+        if not isinstance(data, pd.DataFrame):
+            raise TypeError("data must be a pandas DataFrame.")
+        required_columns = {"timestamp", SYMBOL}
+        missing_columns = required_columns.difference(data.columns)
+        if missing_columns:
+            raise InvalidConfigurationError(
+                f"data is missing required columns: {sorted(missing_columns)}."
+            )
+        if isinstance(execution_delay, bool) or not isinstance(
+            execution_delay, Integral
+        ):
+            raise InvalidConfigurationError(
+                "execution_delay must be a non-negative integer."
+            )
+        if execution_delay < 0:
+            raise InvalidConfigurationError(
+                "execution_delay must be a non-negative integer."
+            )
+        delay = int(execution_delay)
+        grid = _validate_parameter_grid(parameter_grid, self.base_config.strategy_name)
+
+        # A benchmark can have a different calendar, so folds follow only the
+        # tradable universe.
+        tradable = data[data[SYMBOL].isin(set(self.base_config.symbols))]
+        present_symbols = set(tradable[SYMBOL].unique())
+        missing_symbols = [
+            symbol
+            for symbol in self.base_config.symbols
+            if symbol not in present_symbols
+        ]
+        if missing_symbols:
+            raise InvalidConfigurationError(
+                "Walk-forward data is missing configured tradable symbol(s): "
+                f"{missing_symbols}. Refusing to validate a reduced universe."
+            )
+        # train_window/validation_window/test_window are likewise never
+        # pre-validated here -- walk_forward_windows() below is the single
+        # place that validates every window parameter, `step` included.
+        index = pd.DatetimeIndex(price_matrix(tradable, adjusted=True).index)
+        windows = walk_forward_windows(
+            index,
+            train_window,
+            validation_window,
+            test_window,
+            expanding=expanding,
+            step=step,
+        )
+        # None resolves to test_window, matching walk_forward_windows()'s own
+        # default -- read back here (rather than reconstructed independently)
+        # only after the call above has already validated it.
+        resolved_step = test_window if step is None else int(step)
+        if not windows:
+            logger.warning(
+                "No walk-forward windows fit in %d observations with "
+                "train=%d validation=%d test=%d step=%d.",
+                len(index),
+                train_window,
+                validation_window,
+                test_window,
+                resolved_step,
+            )
+
+        combinations = _grid_combinations(grid)
+        periods_per_year = positive_int(
+            self.base_config.periods_per_year, name="periods_per_year"
+        )
+        risk_free_rate = finite_real(
+            self.base_config.backtest.risk_free_rate, name="risk_free_rate"
+        )
+        metric = self.base_config.validation.optimization_metric
+        try:
+            scorer = _SCORERS[metric]
+        except KeyError as exc:
+            raise InvalidConfigurationError(
+                f"Unsupported walk-forward optimization metric: {metric!r}."
+            ) from exc
+        return _PreparedWalkForward(
+            tradable=tradable,
+            windows=windows,
+            combinations=combinations,
+            periods_per_year=periods_per_year,
+            risk_free_rate=risk_free_rate,
+            scorer=scorer,
+            grid=grid,
+            delay=delay,
+            step=resolved_step,
+        )
+
+    def _finalize(
+        self,
+        fold_windows: list[WalkForwardWindow],
+        fold_parameters: list[dict[str, Any]],
+        fold_scores: list[float],
+        target_pieces: list[pd.DataFrame],
+        tradable: pd.DataFrame,
+        data: pd.DataFrame,
+        active_config: ExperimentConfig,
+        periods_per_year: int,
+        risk_free_rate: float,
+        delay: int,
+        grid: Mapping[str, Sequence[Any]],
+        train_window: int,
+        validation_window: int,
+        test_window: int,
+        step: int,
+        expanding: bool,
+        started: float,
+    ) -> WalkForwardResult:
+        """Stitch fold selections into OOS accounting and a WalkForwardResult.
+
+        Shared by every selection path (:meth:`run`,
+        :meth:`run_with_weight_cache`, :meth:`rescore_with_costs`) so
+        rebalancing/turnover-capping, delay-shifting and final accounting
+        run identically regardless of which one produced the winners, using
+        whichever config (``active_config``) is actually in effect for the
+        scenario being finalised.
+        """
+        # Applying rebalancing, turnover and accounting once preserves state
+        # and transaction costs across fold boundaries.
+        if target_pieces:
+            all_targets = pd.concat(target_pieces)
+            if step < test_window:
+                # An intentionally smaller step overlaps consecutive test
+                # blocks by design (see walk_forward_windows()'s docstring)
+                # -- target_pieces is in fold order, so keeping the LAST
+                # occurrence of a repeated date keeps the most recent
+                # fold's (more up-to-date training data) decision for it,
+                # done here, before sort_index() below, while "last in the
+                # concatenation" still unambiguously means "from the
+                # highest-numbered fold" (a stable post-sort tiebreak is
+                # not guaranteed).
+                all_targets = all_targets[~all_targets.index.duplicated(keep="last")]
+            elif not all_targets.index.is_unique:
+                duplicates = all_targets.index[all_targets.index.duplicated()].unique()
+                raise InvalidConfigurationError(
+                    "Walk-forward test blocks overlap; duplicate target dates: "
+                    f"{list(duplicates[:5])}."
+                )
+            all_targets = all_targets.sort_index()
+            tradable_mask = _tradable_mask_if_mixed_calendar(
+                active_config, pd.DatetimeIndex(all_targets.index)
+            )
+            shared_calendar = uniform_calendar(
+                instrument.calendar for instrument in active_config.data.instruments
+            )
+            # Mirrors engine.py's own `decision_portfolio_config`: when
+            # weight drift is enabled, `apply_weight_drift` (via
+            # run_accounting, below) is the sole place `maximum_turnover`
+            # is applied -- capping it here too would hand the drift layer
+            # an already-capped intermediate target instead of the true
+            # schedule target, letting it trade the portfolio backward
+            # toward that stale value once organic drift has carried it
+            # past it.
+            decision_portfolio_config = (
+                active_config.portfolio.revalidated_copy(
+                    update={"maximum_turnover": None}
+                )
+                if active_config.portfolio.model_weight_drift
+                else active_config.portfolio
+            )
+            all_weights = rebalance_and_cap_turnover(
+                all_targets,
+                decision_portfolio_config,
+                tradable=tradable_mask,
+                calendar=shared_calendar,
+            )
+
+            # A target chosen on a rebalance bar becomes the executed position
+            # on the following bar.
+            schedule = compute_rebalance_dates(
+                pd.DatetimeIndex(all_weights.index),
+                active_config.portfolio.rebalance_frequency,
+                calendar=shared_calendar,
+            )
+            aligned_starts: list[pd.Timestamp] = []
+            for window in fold_windows:
+                candidates = schedule[
+                    (schedule >= window.test[0]) & (schedule <= window.test[-1])
+                ]
+                if len(candidates) == 0:
+                    raise InvalidConfigurationError(
+                        f"Fold {window.fold}: its test block contains no rebalance "
+                        "date; increase test_window or rebalance more often."
+                    )
+                location = all_weights.index.get_loc(candidates[0])
+                if not isinstance(location, int):
+                    raise InvalidConfigurationError(
+                        f"Fold {window.fold}: rebalance date is not unique."
+                    )
+                execution_location = location + 1
+                if (
+                    execution_location >= len(all_weights.index)
+                    or all_weights.index[execution_location] > window.test[-1]
+                ):
+                    raise InvalidConfigurationError(
+                        f"Fold {window.fold}: no test return occurs after its first "
+                        "rebalance; increase test_window or rebalance more often."
+                    )
+                aligned_starts.append(all_weights.index[execution_location])
+
+            for previous_window, window, previous_start, start in zip(
+                fold_windows,
+                fold_windows[1:],
+                aligned_starts,
+                aligned_starts[1:],
+                strict=False,
+            ):
+                if start <= previous_start:
+                    raise InvalidConfigurationError(
+                        f"Fold {window.fold}'s first execution date ({start.date()}) "
+                        f"does not come after fold {previous_window.fold}'s "
+                        f"({previous_start.date()}) -- a small step combined with "
+                        "infrequent rebalancing collapsed these folds' reporting "
+                        "windows onto each other, which would attribute zero (or "
+                        "the wrong) observations to one of them; increase step or "
+                        "rebalance more often."
+                    )
+
+            prices = price_matrix(tradable, adjusted=True)
+            asset_returns = compute_asset_returns(prices).reindex(all_weights.index)
+            execution_model = build_execution_from_config(active_config, data)
+            aligned_tradable_mask = (
+                tradable_mask.reindex(
+                    index=all_weights.index, columns=all_weights.columns
+                ).fillna(True)
+                if tradable_mask is not None
+                else None
+            )
+            executed_weights = all_weights
+            if delay > 0:
+                if aligned_tradable_mask is not None:
+                    # A raw row-count shift would delay execution onto a
+                    # date a symbol can't actually trade on -- the mandatory
+                    # look-ahead-barrier shift inside run_accounting avoids
+                    # exactly this, and the extra configured delay must
+                    # avoid it too.
+                    executed_weights = shift_respecting_tradability(
+                        executed_weights, delay, aligned_tradable_mask
+                    ).fillna(0.0)
+                else:
+                    executed_weights = executed_weights.shift(delay).fillna(0.0)
+            # Computed once (needed by both overnight_returns_for_config
+            # below and reference_prices_for_config inside
+            # _build_oos_result further down) and threaded into each,
+            # mirroring engine.py's own BacktestEngine.run() pattern.
+            adjusted_open = adjusted_open_for_config(
+                active_config,
+                tradable,
+                execution_price_source=self.execution_price_source,
+            )
+            accounting = run_accounting(
+                executed_weights,
+                asset_returns,
+                execution_model,
+                active_config.initial_capital,
+                tradable=aligned_tradable_mask,
+                rebalance_date=_rebalance_date_for_run_accounting(
+                    all_weights,
+                    active_config.portfolio.rebalance_frequency,
+                    shared_calendar,
+                    aligned_tradable_mask,
+                    delay,
+                ),
+                overnight_returns=overnight_returns_for_config(
+                    active_config,
+                    tradable,
+                    prices,
+                    execution_price_source=self.execution_price_source,
+                    adjusted_open=adjusted_open,
+                ),
+                **_accounting_kwargs_for_config(active_config),
+            )
+            oos_returns = accounting.net_returns
+            oos_equity = accounting.equity
+            oos_result = self._build_oos_result(
+                data,
+                tradable,
+                active_config,
+                accounting,
+                execution_model,
+                all_weights,
+                all_targets,
+                periods_per_year,
+                risk_free_rate,
+                delay,
+                started,
+                grid,
+                train_window,
+                validation_window,
+                test_window,
+                step,
+                expanding,
+                adjusted_open=adjusted_open,
+            )
+        else:
+            oos_returns = pd.Series(dtype=float)
+            oos_equity = pd.Series(dtype=float)
+            oos_result = None
+            aligned_starts = []
+
+        fold_results: list[FoldResult] = []
+        for position, (window, parameters, score) in enumerate(
+            zip(fold_windows, fold_parameters, fold_scores, strict=True)
+        ):
+            test_start = aligned_starts[position]
+            if position + 1 < len(aligned_starts):
+                next_location = oos_returns.index.get_loc(aligned_starts[position + 1])
+                if not isinstance(next_location, int):
+                    raise InvalidConfigurationError(
+                        "Walk-forward reporting boundaries must be unique."
+                    )
+                test_end = oos_returns.index[next_location - 1]
+            else:
+                test_end = oos_returns.index[-1]
+            fold_returns = oos_returns.loc[test_start:test_end]
+            fold_equity = M.equity_from_returns(fold_returns)
+            fold_sharpe = M.sharpe_ratio(fold_returns, risk_free_rate, periods_per_year)
+            fold_results.append(
+                FoldResult(
+                    fold=window.fold,
+                    best_params=parameters,
+                    validation_score=score,
+                    test_return=M.total_return(fold_equity),
+                    test_sharpe=fold_sharpe,
+                    test_returns=fold_returns,
+                )
+            )
+            logger.info(
+                "Fold %d: best=%s validation_score=%.3f test_sharpe=%.3f",
+                window.fold,
+                parameters,
+                score,
+                fold_sharpe,
+            )
+
+        return WalkForwardResult(fold_results, oos_returns, oos_equity, oos_result)
+
+    def _build_oos_result(
+        self,
+        data: pd.DataFrame,
+        tradable: pd.DataFrame,
+        active_config: ExperimentConfig,
+        accounting: AccountingResult,
+        execution_model: ExecutionModel,
+        all_weights: pd.DataFrame,
+        all_targets: pd.DataFrame,
+        periods_per_year: int,
+        risk_free_rate: float,
+        delay: int,
+        started: float,
+        grid: Mapping[str, Sequence[Any]],
+        train_window: int,
+        validation_window: int,
+        test_window: int,
+        step: int,
+        expanding: bool,
+        *,
+        adjusted_open: pd.DataFrame | None,
+    ) -> BacktestResult:
+        """Build a genuine BacktestResult from the stitched OOS series.
+
+        Reuses the exact trade-log/benchmark/metrics pipeline
+        :class:`~quantlab.backtesting.engine.BacktestEngine` uses for a
+        single backtest, so existing result-rendering code (dashboard, HTML
+        report) works unchanged on a walk-forward's out-of-sample result.
+        ``active_config`` is the config actually in effect for this result
+        (``self.base_config`` from :meth:`run`/:meth:`run_with_weight_cache`,
+        or a cost-scenario config from :meth:`rescore_with_costs`), so its
+        cost fields and metadata describe what was actually run.
+
+        ``adjusted_open`` -- the caller's own already-derived
+        ``adjusted_open_for_config(...)`` result (``_finalize`` needs the
+        same matrix for its own ``overnight_returns_for_config`` call),
+        reused here for :func:`reference_prices_for_config` instead of
+        deriving it a second time.
+        """
+        # No trigger_*/adjustment_*/position_strategy_origin_* provenance is
+        # passed here: attribution is unavailable in this aggregated
+        # walk-forward reconstruction. The stitched out-of-sample series is
+        # rebuilt from per-fold weights, not from a single engine run's
+        # diagnostic frames -- each fold reruns the pipeline independently
+        # with its own warmup/fit, and those frames do not survive the
+        # cut/restitch across folds. `build_trade_log` leaves the reason
+        # columns `None`/`NaT` whenever these kwargs are omitted (its
+        # documented legacy/no-attribution path), which is correct here, not
+        # a bug to fix.
+        reference_prices, reference_price_needs_shift = reference_prices_for_config(
+            active_config,
+            tradable,
+            price_matrix(tradable, adjusted=False),
+            execution_price_source=self.execution_price_source,
+            adjusted_open=adjusted_open,
+        )
+        trades = build_trade_log(
+            accounting.executed_weights,
+            accounting.weight_changes_for_costs,
+            accounting.equity,
+            reference_prices,
+            reference_price_needs_shift=reference_price_needs_shift,
+            commission_bps=active_config.commission_bps,
+            spread_bps=active_config.spread_bps,
+            slippage_model=execution_model.slippage,
+            slippage_equity=accounting.equity_for_costs,
+            execution_equity=accounting.execution_equity,
+        )
+        benchmark_data = (
+            data if active_config.benchmark_kind is BenchmarkKind.SYMBOL else tradable
+        )
+        benchmark_returns = build_benchmark(
+            benchmark_data,
+            pd.DatetimeIndex(accounting.net_returns.index),
+            benchmark_symbol=active_config.benchmark_symbol,
+            benchmark_calendar=active_config.benchmark_calendar,
+            first_asset_symbol=active_config.symbols[0],
+            risk_free_rate=risk_free_rate,
+            periods_per_year=periods_per_year,
+            kind=str(active_config.benchmark_kind),
+        )
+        metrics = M.compute_metrics(
+            accounting.net_returns,
+            accounting.equity,
+            benchmark_returns=benchmark_returns,
+            risk_free_rate=risk_free_rate,
+            periods_per_year=periods_per_year,
+        )
+        metrics.update(portfolio_metrics_from_accounting(accounting, periods_per_year))
+        metrics["number_of_trades"] = float(len(trades))
+        metrics["average_trade_size"] = (
+            float(trades["traded_notional"].mean()) if len(trades) else 0.0
+        )
+        metrics["total_cost_fraction"] = float(accounting.costs.total.sum())
+
+        metadata: dict[str, Any] = {
+            "run_timestamp": datetime.now(UTC).isoformat(),
+            "experiment_name": active_config.experiment_name,
+            "strategy": active_config.strategy_name,
+            "allocator": active_config.portfolio.allocator,
+            "commission_bps": active_config.commission_bps,
+            "spread_bps": active_config.spread_bps,
+            "symbols": active_config.symbols,
+            "start_date": str(active_config.start_date),
+            "end_date": str(active_config.end_date),
+            "random_seed": active_config.random_seed,
+            "n_rows": len(accounting.net_returns),
+            "elapsed_seconds": round(time.perf_counter() - started, 4),
+            "periods_per_year": periods_per_year,
+            "data_hash": ParquetStorage.hash_frame(data),
+            "git_commit": _git_commit_hash(),
+            "git_dirty": _git_is_dirty(),
+            "dependency_versions": _dependency_versions(),
+            "code_hash": _source_hash(),
+            "generator_hash": _generator_hash(),
+            "walk_forward_execution_delay": delay,
+            # Unlike BacktestEngine.run() (docs/api.md documents passing it
+            # a custom strategy/allocator/execution-model instance directly,
+            # see its own config_yaml_reflects_*), WalkForwardValidator never
+            # accepts a custom strategy/allocator/execution-model instance:
+            # every one of those is always built via
+            # build_strategy_from_config/build_allocator_from_config/
+            # build_execution_from_config(active_config, ...), so there is
+            # no possible mismatch to verify for THOSE three. It DOES accept
+            # a custom `execution_price_source` (see this class's own
+            # constructor docstring) -- a config-only rebuild has no field
+            # for it at all, so a non-default source given here means the
+            # execution result is NOT reproducible from config.yaml alone,
+            # UNLESS the source was never even consulted: it's only ever
+            # read under next_bar_open (overnight_returns_for_config/
+            # reference_prices_for_config both early-return without
+            # touching it otherwise), exactly like BacktestEngine.run()'s
+            # own config_yaml_reflects_execution treats it.
+            "config_yaml_reflects_strategy": True,
+            "config_yaml_reflects_allocator": True,
+            "config_yaml_reflects_execution": (
+                self.execution_price_source is None
+                or not execution_price_source_is_consulted(active_config)
+            ),
+            "execution_price_source_fingerprint": execution_price_source_fingerprint(
+                self.execution_price_source
+            ),
+            # `metrics` (below) *are* the out-of-sample metrics — this result
+            # is the stitched OOS series, not a full-sample fit. Mirrored
+            # into metadata under this exact key because
+            # `research_summary._oos_metrics()` and the HTML report's
+            # methodology/hypothesis/conclusion text look for it there to
+            # decide whether to describe evidence as out-of-sample; without
+            # it, a genuinely-OOS walk-forward result was mislabelled
+            # "full-sample only, no out-of-sample evidence attached".
+            "walk_forward_oos_metrics": metrics,
+            "walk_forward_parameter_grid": dict(grid),
+            "walk_forward_windows": {
+                "train_window": train_window,
+                "validation_window": validation_window,
+                "test_window": test_window,
+                "step": step,
+                "expanding": expanding,
+            },
+            # Consolidated view for full reproducibility -- mirrors the two
+            # keys just above (never a replacement for them: other code
+            # reads those by their own exact name, see e.g.
+            # `load_previous_walk_forward_robustness`). `result.save()`
+            # later adds `signal_price_type` to this same dict.
+            "resolved_config": {
+                "walk_forward": {
+                    "train_window": train_window,
+                    "validation_window": validation_window,
+                    "test_window": test_window,
+                    "step": step,
+                    "expanding": expanding,
+                    "parameter_grid": dict(grid),
+                    "optimization_metric": str(
+                        active_config.validation.optimization_metric
+                    ),
+                }
+            },
+        }
+        # Mirrored under these exact keys because
+        # `load_previous_walk_forward_robustness` (quantlab.backtesting.
+        # result) compares them to decide whether a later `quantlab report`
+        # can reuse this bundle's CSVs. Setting them here, not in any one
+        # CLI command, means every caller of this method gets them for free
+        # -- `bootstrap`/`stress-test`/`permutation-test`/`sensitivity` in
+        # walk-forward mode all save this exact `metadata` dict via `result
+        # IS wf.oos_result`, without routing through the dedicated
+        # `walk-forward` command's own code, so a per-command setter would
+        # leave `report` unable to recognise a still-valid bundle any of
+        # those other commands had just saved, and delete it.
+        metadata["walk_forward_config_snapshot"] = active_config.model_dump(mode="json")
+        metadata["walk_forward_run_timestamp"] = metadata["run_timestamp"]
+
+        return BacktestResult(
+            config=active_config,
+            equity_curve=accounting.equity,
+            returns=accounting.net_returns,
+            benchmark_returns=benchmark_returns,
+            positions=accounting.executed_weights,
+            weights=all_weights,
+            target_weights=all_targets,
+            signals=pd.DataFrame(),
+            trades=trades,
+            costs=accounting.costs.to_frame(),
+            metrics=metrics,
+            metadata=metadata,
+            gross_returns=accounting.gross_returns,
+            gross_equity=accounting.gross_equity,
+            turnover=accounting.turnover,
+        )
+
+    def _select_on_validation(
+        self,
+        data: pd.DataFrame,
+        window: WalkForwardWindow,
+        combinations: list[dict[str, Any]],
+        scorer: Callable[[pd.Series, pd.Series, int, float], float],
+        periods_per_year: int,
+        risk_free_rate: float,
+        *,
+        execution_delay: int = 0,
+        on_candidate: Callable[[], None] | None = None,
+    ) -> dict[str, Any]:
+        """Select the finite, highest-scoring parameter combination.
+
+        ``on_candidate``, if given, is called once after each candidate is
+        considered (including ones skipped for insufficient warm-up), for
+        finer-grained progress reporting than one tick per fold — see
+        :meth:`_select_and_capture`, which does the same.
+        """
+        best_score = -np.inf
+        best_parameters: dict[str, Any] | None = None
+        insufficient_warmup = 0
+        # Loop-invariant across every candidate below (a candidate's own
+        # `_with_params` override only ever touches `config.strategy.
+        # parameters`, never `config.execution`/`config.symbols`) --
+        # computed once per fold, not once per candidate, but LAZILY (on
+        # first actually-evaluated candidate, not unconditionally up
+        # front): a fold where every combination is structurally
+        # unwarmed must still never touch `data` at all, matching
+        # run()'s own "no evaluation happens" contract for that case.
+        overnight_returns: pd.DataFrame | None = None
+        overnight_returns_ready = False
+        for combination in combinations:
+            config = _with_params(self.base_config, combination)
+            required = _minimum_observations_for_executable_weight(config)
+            available = len(window.train) + len(window.validation)
+            if len(window.validation) < 2 or available < required:
+                insufficient_warmup += 1
+                logger.debug(
+                    "Fold %d: skipping %s because validation ends after %d "
+                    "observations but this configuration needs at least %d "
+                    "before an executable weight can be scored.",
+                    window.fold,
+                    combination,
+                    available,
+                    required,
+                )
+                if on_candidate is not None:
+                    on_candidate()
+                continue
+            if not overnight_returns_ready:
+                overnight_returns = _overnight_returns_for_fold(
+                    data,
+                    self.base_config,
+                    window.train[0],
+                    window.validation[-1],
+                    execution_price_source=self.execution_price_source,
+                )
+                overnight_returns_ready = True
+            returns = _evaluate_fresh_from_window_start(
+                data,
+                config,
+                window.train[0],
+                window.validation[0],
+                window.validation[-1],
+                execution_delay=execution_delay,
+                execution_price_source=self.execution_price_source,
+                overnight_returns=overnight_returns,
+            )
+            equity = M.equity_from_returns(returns)
+            score = scorer(returns, equity, periods_per_year, risk_free_rate)
+            if on_candidate is not None:
+                on_candidate()
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_parameters = combination
+        if best_parameters is None:
+            if combinations and insufficient_warmup == len(combinations):
+                raise InvalidConfigurationError(
+                    f"Fold {window.fold}: no parameter combination has enough "
+                    "train/validation history to produce an executable weight "
+                    "inside the validation block. Increase the windows or use "
+                    "shorter strategy warm-up parameters."
+                )
+            raise InvalidConfigurationError(
+                f"Fold {window.fold}: every parameter combination produced a "
+                "non-finite validation score."
+            )
+        return {"params": best_parameters, "score": float(best_score)}
+
+    def _select_and_capture(
+        self,
+        data: pd.DataFrame,
+        window: WalkForwardWindow,
+        combinations: list[dict[str, Any]],
+        scorer: Callable[[pd.Series, pd.Series, int, float], float],
+        periods_per_year: int,
+        risk_free_rate: float,
+        *,
+        execution_delay: int = 0,
+        on_candidate: Callable[[], None] | None = None,
+    ) -> tuple[int, float, list[_FoldCandidateWeights]]:
+        """Capture every candidate's weights alongside selection.
+
+        Like :meth:`_select_on_validation`, but also captures every
+        candidate's weights into a :class:`WalkForwardWeightCache` row.
+        Test-block target weights are computed for every candidate, not
+        only the fold's winner, since a different candidate can win once a
+        cost-only scenario re-scores this fold with
+        :meth:`rescore_with_costs`. ``on_candidate``, if given, is called
+        once after each candidate is considered (including ones skipped for
+        insufficient warm-up), for finer-grained progress reporting than
+        one tick per fold.
+        """
+        best_score = -np.inf
+        best_index: int | None = None
+        insufficient_warmup = 0
+        captured: list[_FoldCandidateWeights] = []
+        # Loop-invariant across every candidate below, computed lazily --
+        # see _select_on_validation's identical comment.
+        overnight_returns: pd.DataFrame | None = None
+        overnight_returns_ready = False
+        for index, combination in enumerate(combinations):
+            config = _with_params(self.base_config, combination)
+            required = _minimum_observations_for_executable_weight(config)
+            available = len(window.train) + len(window.validation)
+            if len(window.validation) < 2 or available < required:
+                insufficient_warmup += 1
+                logger.debug(
+                    "Fold %d: skipping %s because validation ends after %d "
+                    "observations but this configuration needs at least %d "
+                    "before an executable weight can be scored.",
+                    window.fold,
+                    combination,
+                    available,
+                    required,
+                )
+                captured.append(_FoldCandidateWeights(None, None))
+                if on_candidate is not None:
+                    on_candidate()
+                continue
+            if not overnight_returns_ready:
+                overnight_returns = _overnight_returns_for_fold(
+                    data,
+                    self.base_config,
+                    window.train[0],
+                    window.validation[-1],
+                    execution_price_source=self.execution_price_source,
+                )
+                overnight_returns_ready = True
+            validation_weights, returns = _weights_and_returns_for_validation(
+                data,
+                config,
+                window.train[0],
+                window.validation[0],
+                window.validation[-1],
+                execution_delay=execution_delay,
+                execution_price_source=self.execution_price_source,
+                overnight_returns=overnight_returns,
+            )
+            equity = M.equity_from_returns(returns)
+            score = scorer(returns, equity, periods_per_year, risk_free_rate)
+            test_targets = _target_weights_for_window(
+                data,
+                config,
+                window.train[0],
+                window.test[0],
+                window.test[-1],
+                execution_price_source=self.execution_price_source,
+            )
+            captured.append(_FoldCandidateWeights(validation_weights, test_targets))
+            if on_candidate is not None:
+                on_candidate()
+            if np.isfinite(score) and score > best_score:
+                best_score = score
+                best_index = index
+        if best_index is None:
+            if combinations and insufficient_warmup == len(combinations):
+                raise InvalidConfigurationError(
+                    f"Fold {window.fold}: no parameter combination has enough "
+                    "train/validation history to produce an executable weight "
+                    "inside the validation block. Increase the windows or use "
+                    "shorter strategy warm-up parameters."
+                )
+            raise InvalidConfigurationError(
+                f"Fold {window.fold}: every parameter combination produced a "
+                "non-finite validation score."
+            )
+        return best_index, float(best_score), captured
+
+    def _weights_on_test(
+        self, data: pd.DataFrame, window: WalkForwardWindow, params: dict[str, Any]
+    ) -> pd.DataFrame:
+        """Return constrained test targets before scheduling and turnover."""
+        config = _with_params(self.base_config, params)
+        return _target_weights_for_window(
+            data,
+            config,
+            window.train[0],
+            window.test[0],
+            window.test[-1],
+            execution_price_source=self.execution_price_source,
+        )
+
+
+def _validate_parameter_grid(
+    grid: object, strategy_name: str
+) -> dict[str, Sequence[Any]]:
+    """Validate grid shape and parameter names before running backtests."""
+    if not isinstance(grid, Mapping):
+        raise InvalidConfigurationError("parameter_grid must be a mapping.")
+    accepted = strategy_parameter_names(strategy_name)
+    validated: dict[str, Sequence[Any]] = {}
+    for name, values in grid.items():
+        if not isinstance(name, str) or not name:
+            raise InvalidConfigurationError(
+                "Parameter-grid names must be non-empty strings."
+            )
+        if name not in accepted:
+            raise InvalidConfigurationError(
+                f"Unknown parameter {name!r} for strategy {strategy_name!r}."
+            )
+        if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+            raise InvalidConfigurationError(
+                f"Grid parameter {name!r} must contain a sequence of values."
+            )
+        if _contains_duplicate_candidates(values):
+            raise InvalidConfigurationError(
+                f"Grid parameter {name!r} must not contain duplicate values."
+            )
+        validated[name] = values
+    return validated
+
+
+def _contains_duplicate_candidates(values: Sequence[Any]) -> bool:
+    """Detect repeated candidates without requiring hashable values."""
+    for position, value in enumerate(values):
+        for previous in values[:position]:
+            equal = value == previous
+            if isinstance(equal, (np.ndarray, pd.Series)):
+                if bool(np.asarray(equal).all()):
+                    return True
+            elif bool(equal):
+                return True
+    return False
+
+
+def _grid_combinations(
+    grid: Mapping[str, Sequence[Any]],
+) -> list[dict[str, Any]]:
+    """Expand a validated parameter grid into concrete combinations."""
+    if not grid:
+        return [{}]
+    empty = [name for name, values in grid.items() if not values]
+    if empty:
+        raise InvalidConfigurationError(
+            f"Parameter grid entries {empty} have no candidate values."
+        )
+    keys = list(grid)
+    return [
+        dict(zip(keys, values, strict=True))
+        for values in itertools.product(*grid.values())
+    ]
+
+
+def _tradable_mask_if_mixed_calendar(
+    config: ExperimentConfig, index: pd.DatetimeIndex
+) -> pd.DataFrame | None:
+    """Per-symbol tradability mask, only when a raw shift could be wrong.
+
+    ``None`` when every instrument shares one calendar (a raw shift is
+    already exactly correct, no closure can occur) or the frequency isn't
+    daily (closure semantics are only well-defined at daily granularity, see
+    :mod:`quantlab.data.closures`). Shared by every accounting call site
+    (fold-level candidate scoring, cost-only rescoring, final OOS stitching)
+    so parameter *selection* is never scored under a different execution
+    timing than the *finalised* result it selects for.
+    """
+    if config.data.frequency != DAILY_FREQUENCY:
+        return None
+    symbol_calendars = {
+        instrument.symbol: instrument.calendar for instrument in config.data.instruments
+    }
+    if uniform_calendar(symbol_calendars.values()) is not None:
+        return None
+    return tradable_mask_for(index, config.symbols, symbol_calendars)
+
+
+def _accounting_kwargs_for_config(config: ExperimentConfig) -> dict[str, Any]:
+    """The non-``tradable`` ``run_accounting`` keyword arguments a full run would use.
+
+    Mirrors :class:`~quantlab.backtesting.engine.BacktestEngine`'s own call
+    exactly (including its ``maximum_gross_exposure``/``maximum_leverage``
+    combined-cap convention). Every accounting call site in this module
+    must use this (candidate scoring, cost-only rescoring, final OOS
+    stitching) so walk-forward's own numbers stay in parity with the main
+    backtest under the same YAML, instead of silently ignoring stop-loss/
+    take-profit/position-groups/weight-drift/exposure-limit configuration.
+    """
+    strategy = build_strategy_from_config(config)
+    portfolio = config.portfolio
+    maximum_gross_exposure = (
+        min(portfolio.maximum_gross_exposure, portfolio.maximum_leverage)
+        if portfolio.maximum_gross_exposure is not None
+        else portfolio.maximum_leverage
+    )
+    return {
+        "stop_loss_pct": strategy.stop_loss_pct,
+        "take_profit_pct": strategy.take_profit_pct,
+        "position_groups": strategy.position_groups(),
+        "model_weight_drift": portfolio.model_weight_drift,
+        "maximum_weight": portfolio.maximum_weight,
+        "maximum_gross_exposure": maximum_gross_exposure,
+        "maximum_net_exposure": portfolio.maximum_net_exposure,
+        "long_only": portfolio.long_only,
+        "maximum_turnover": portfolio.maximum_turnover,
+    }
+
+
+def _rebalance_date_for_run_accounting(
+    decision_weights: pd.DataFrame,
+    frequency: RebalanceFrequency | str,
+    calendar: str | None,
+    tradable_mask: pd.DataFrame | None,
+    delay: int,
+) -> pd.DataFrame:
+    """Boolean, aligned exactly like `run_accounting`'s own `rebalance_date`.
+
+    Mirrors `BacktestEngine.run()`'s identical construction: a genuine
+    scheduled-rebalance-date flag, broadcast across every column at the
+    DECISION cadence, shifted onto the EXECUTED timeline the same way
+    ``decision_weights`` itself becomes executed (any extra configured
+    delay, then the mandatory look-ahead-barrier shift) -- required so
+    `apply_weight_drift`'s own anchor detection (see its docstring) can
+    catch a scheduled rebalance whose freshly-decided target happens to
+    numerically match the immediately preceding one, which plain
+    value-diffing `executed` against its own previous row cannot.
+    Per-column, NOT collapsed with `.any(axis=1)`: a closed instrument
+    must never be forced to anchor just because another instrument's own
+    schedule/value-change fires the same row.
+    """
+    schedule = compute_rebalance_dates(
+        pd.DatetimeIndex(decision_weights.index), frequency, calendar=calendar
+    )
+    is_rebalance_date = pd.DataFrame(
+        np.broadcast_to(
+            decision_weights.index.isin(schedule)[:, None], decision_weights.shape
+        ),
+        index=decision_weights.index,
+        columns=decision_weights.columns,
+        dtype=float,
+    )
+    if delay > 0:
+        is_rebalance_date = (
+            shift_respecting_tradability(is_rebalance_date, delay, tradable_mask)
+            if tradable_mask is not None
+            else is_rebalance_date.shift(delay)
+        ).fillna(0.0)
+    aligned = compute_executed_weights(is_rebalance_date, tradable=tradable_mask)
+    flag = aligned > 0.5
+    # `compute_executed_weights` is built for *weights*, where a closed row
+    # correctly repeats the last tradable row's value. Applied to a boolean
+    # flag, that same repetition would keep it True for every row a column
+    # stays closed after it lands True once -- wrong for a flag, which must
+    # describe THIS row's own event. AND with `tradable_mask` so a closed
+    # row's flag is always False, matching apply_weight_drift's own
+    # documented precondition.
+    if tradable_mask is not None:
+        flag = flag & tradable_mask
+    return flag
+
+
+def _slice_between(
+    data: pd.DataFrame, start: pd.Timestamp, end: pd.Timestamp
+) -> pd.DataFrame:
+    """Return rows whose timestamps lie in the inclusive interval."""
+    timestamps = pd.to_datetime(data["timestamp"])
+    mask = (timestamps >= pd.Timestamp(start)) & (timestamps <= pd.Timestamp(end))
+    return data.loc[mask].reset_index(drop=True)
+
+
+def _weights_for_window(
+    sliced: pd.DataFrame,
+    config: ExperimentConfig,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
+) -> pd.DataFrame:
+    """Return held weights after supplying the required lookback history.
+
+    ``sliced``: the caller's own already-``_slice_between``-d frame
+    (``[lookback_start, window_end]``), passed in rather than re-derived
+    here -- this function's one caller,
+    :func:`_weights_and_returns_for_validation`, already computes the
+    identical slice for its own accounting step, so re-slicing here would
+    redo that same full-panel mask/copy a second time for no reason.
+    """
+    result = run_backtest_from_config(
+        sliced,
+        config,
+        execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
+    )
+    return result.weights.loc[window_start:window_end]
+
+
+def _target_weights_for_window(
+    data: pd.DataFrame,
+    config: ExperimentConfig,
+    lookback_start: pd.Timestamp,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_price_source: ExecutionPriceSource | None = None,
+) -> pd.DataFrame:
+    """Return constrained targets before scheduling and turnover capping."""
+    sliced = _slice_between(data, lookback_start, window_end)
+    result = run_backtest_from_config(
+        sliced, config, execution_price_source=execution_price_source
+    )
+    if result.target_weights is None:
+        raise InvalidConfigurationError("Backtest did not expose target weights.")
+    return result.target_weights.loc[window_start:window_end]
+
+
+def _overnight_returns_for_fold(
+    data: pd.DataFrame,
+    config: ExperimentConfig,
+    lookback_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_price_source: ExecutionPriceSource | None,
+) -> pd.DataFrame | None:
+    """overnight_returns_for_config, from the tradable/prices slice for one fold.
+
+    A parameter-grid candidate's own ``_with_params`` override only ever
+    touches ``config.strategy.parameters`` -- never ``config.execution``
+    or ``config.symbols`` -- so this result is provably identical across
+    every candidate scored for the same fold. Callers compute it ONCE per
+    fold and pass it into every one of that fold's per-candidate calls,
+    instead of paying for a fresh ``adjusted_open`` derivation (3
+    full-panel pivots plus a division) on every candidate.
+    """
+    sliced = _slice_between(data, lookback_start, window_end)
+    tradable = sliced[sliced[SYMBOL].isin(set(config.symbols))]
+    prices = price_matrix(tradable, adjusted=True)
+    return overnight_returns_for_config(
+        config, tradable, prices, execution_price_source=execution_price_source
+    )
+
+
+def _weights_and_returns_for_validation(
+    data: pd.DataFrame,
+    config: ExperimentConfig,
+    lookback_start: pd.Timestamp,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
+    overnight_returns: pd.DataFrame | None,
+) -> tuple[pd.DataFrame, pd.Series]:
+    """Return one candidate's (held weights, net returns) on a block.
+
+    Split out of the former ``_evaluate_fresh_from_window_start`` so
+    ``WalkForwardValidator._select_and_capture`` can retain the weights
+    instead of discarding them, without duplicating this accounting logic.
+
+    ``execution_price_source`` is forwarded to ``_weights_for_window``
+    (the weight-generation path); ``overnight_returns`` -- normally
+    produced by :func:`_overnight_returns_for_fold` once per fold, not
+    once per candidate -- is used directly for this call's own
+    accounting. See ``WalkForwardValidator``'s own constructor docstring.
+    """
+    sliced = _slice_between(data, lookback_start, window_end)
+    window_weights = _weights_for_window(
+        sliced,
+        config,
+        window_start,
+        window_end,
+        execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
+    )
+    tradable = sliced[sliced[SYMBOL].isin(set(config.symbols))]
+    prices = price_matrix(tradable, adjusted=True)
+    asset_returns = compute_asset_returns(prices).loc[window_start:window_end]
+    execution_model = build_execution_from_config(config, sliced)
+    tradable_mask = _tradable_mask_if_mixed_calendar(
+        config, pd.DatetimeIndex(window_weights.index)
+    )
+    aligned_tradable = (
+        tradable_mask.reindex(
+            index=window_weights.index, columns=window_weights.columns
+        ).fillna(True)
+        if tradable_mask is not None
+        else None
+    )
+    shared_calendar = uniform_calendar(
+        instrument.calendar for instrument in config.data.instruments
+    )
+    accounting = run_accounting(
+        window_weights,
+        asset_returns,
+        execution_model,
+        config.initial_capital,
+        tradable=aligned_tradable,
+        # `window_weights` (from `_weights_for_window`, via
+        # `run_backtest_from_config(..., execution_delay=execution_delay)`)
+        # already has `execution_delay` baked in -- it IS
+        # `BacktestResult.weights`, itself already `_apply_extra_delay`-ed.
+        # Passing `execution_delay` again here would shift it a SECOND
+        # time; `delay=0` matches the sibling call site at this module's
+        # own candidate-scoring loop, which passes the same kind of
+        # already-delayed frame the same way.
+        rebalance_date=_rebalance_date_for_run_accounting(
+            window_weights,
+            config.portfolio.rebalance_frequency,
+            shared_calendar,
+            aligned_tradable,
+            0,
+        ),
+        overnight_returns=overnight_returns,
+        **_accounting_kwargs_for_config(config),
+    )
+    return window_weights, accounting.net_returns
+
+
+def _evaluate_fresh_from_window_start(
+    data: pd.DataFrame,
+    config: ExperimentConfig,
+    lookback_start: pd.Timestamp,
+    window_start: pd.Timestamp,
+    window_end: pd.Timestamp,
+    *,
+    execution_delay: int = 0,
+    execution_price_source: ExecutionPriceSource | None = None,
+    overnight_returns: pd.DataFrame | None,
+) -> pd.Series:
+    """Return independently accounted net returns for candidate scoring."""
+    _, net_returns = _weights_and_returns_for_validation(
+        data,
+        config,
+        lookback_start,
+        window_start,
+        window_end,
+        execution_delay=execution_delay,
+        execution_price_source=execution_price_source,
+        overnight_returns=overnight_returns,
+    )
+    return net_returns
+
+
+def _minimum_observations_for_executable_weight(config: ExperimentConfig) -> int:
+    """Return the structural warm-up needed to score one executed weight.
+
+    This only detects combinations that cannot possibly leave warm-up. It does
+    not inspect whether a sufficiently warmed-up strategy actually chooses to
+    trade, so a legitimate flat validation result remains a valid score.
+    Unknown registered strategies and allocators default to no inferred warm-up.
+    """
+    parameters = build_strategy_from_config(config).parameters()
+    strategy_name = config.strategy_name
+
+    signal_observations = 1
+    if strategy_name in {"time_series_momentum", "cross_sectional_momentum"}:
+        lookback = int(parameters["lookback_period"])
+        signal_observations = lookback + 1
+        if (
+            strategy_name == "time_series_momentum"
+            and parameters["signal_scaling"] == "continuous"
+        ):
+            signal_observations = lookback + min(20, lookback)
+        elif (
+            strategy_name == "time_series_momentum"
+            and parameters["signal_scaling"] == "volatility_adjusted"
+        ):
+            signal_observations = max(
+                signal_observations, int(parameters["volatility_window"]) + 1
+            )
+    elif strategy_name == "mean_reversion":
+        signal_observations = int(parameters["lookback_period"])
+    elif strategy_name == "trend_following":
+        signal_observations = int(parameters["slow_window"])
+    elif strategy_name == "pairs_trading":
+        signal_observations = int(parameters["formation_window"]) + int(
+            parameters["indicator_window"]
+        )
+
+    allocator_observations = 1
+    if config.portfolio.allocator in {"inverse_volatility", "volatility_targeting"}:
+        allocator_observations = config.portfolio.volatility_window + 1
+
+    # Accounting shifts target weights by one bar before applying returns.
+    return max(signal_observations, allocator_observations) + 1

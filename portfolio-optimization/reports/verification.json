@@ -1,0 +1,54 @@
+{
+  "date_utc": "2026-11-10",
+  "python": "3.13.3",
+  "versions": {
+    "numpy": "2.2.5",
+    "pandas": "2.2.3",
+    "scipy": "1.15.3",
+    "scikit-learn": "1.6.1"
+  },
+  "new_downloads": 0,
+  "checks": {
+    "pytest_passed": 52,
+    "pytest_failed": 0,
+    "duration_seconds": 15.96,
+    "warnings": 56,
+    "warning_detail": "SciPy SLSQP clips trial steps outside weight bounds; warnings retained, tests pass.",
+    "python_files_parsed": 46,
+    "backup_sha256_matches": 72,
+    "known_personal_marker_matches": 0,
+    "notebook_code_outputs_remaining": 0
+  },
+  "demo": {
+    "command": "py -3.13 demo_test.py",
+    "data_kind": "explicit seeded synthetic prices",
+    "status": "completed",
+    "results": "offline_demo.json",
+    "evaluation_days": 377
+  },
+  "fixes": [
+    "Opening-holdings simple-return accounting and daily weight drift",
+    "Post-market proportional cost accounting",
+    "Last observed trading date per resampled period",
+    "Preserve already fitted strategy instead of optimizing it again",
+    "Correct risk-parity Jacobian",
+    "Explicit market download failure; mock prices must be requested",
+    "Replace malformed demo; clear identifying notebook outputs and author/profile labels"
+  ],
+  "unverified": [
+    "Live market downloads",
+    "Archived figures and notebook execution",
+    "Plot generation",
+    "Packaging/install build",
+    "Production or brokerage deployment",
+    "Real market performance"
+  ],
+  "limits": [
+    "Close-observation/close-execution assumption without latency",
+    "Final partial period can rebalance on final observation",
+    "Initial holdings funded without an initial transaction charge",
+    "Rebalance failures log warnings and retain drifted holdings",
+    "Long-only fully invested backtest targets",
+    "CVaR nonsmooth objective uses SLSQP; no global-optimum guarantee"
+  ]
+}
